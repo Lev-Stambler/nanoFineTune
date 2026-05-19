@@ -37,8 +37,9 @@ modal run main.py --minutes 0.1 --eval-blocks 2 --grad-accum 1
 - `flash-attn` with `attn_implementation="flash_attention_2"` by default
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
 - sequence packing from streamed FineMath documents into fixed `seq_len` blocks
-- `torch.compile(..., dynamic=False)` plus an untimed compile warmup
+- `torch.compile(..., dynamic=False)` plus an untimed train-shaped compile warmup
 - `bitsandbytes` `AdamW8bit` by default
+- optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
 
 Artifacts are written to the `nanocpt-cache` Modal volume:
 
@@ -68,10 +69,12 @@ Optimizer choices:
 ```bash
 modal run main.py --optimizer-name adamw8bit
 modal run main.py --optimizer-name adamw_fused
+modal run main.py --optimizer-name muon
 ```
 
 Use `adamw8bit` for the memory-saving default and `adamw_fused` for a simpler
-PyTorch fused AdamW baseline.
+PyTorch fused AdamW baseline. Use `muon` for the experimental Muon path; it keeps
+non-Muon tensors on `bitsandbytes` `AdamW8bit`.
 
 Disable compile for the fastest smoke test:
 

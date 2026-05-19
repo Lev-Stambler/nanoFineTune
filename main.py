@@ -91,7 +91,7 @@ def run_track1(
     dataset_id: str = DEFAULT_DATASET_ID,
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
-    optimizer_name: Literal["adamw8bit", "adamw_fused"] = "adamw8bit",
+    optimizer_name: Literal["adamw8bit", "adamw_fused", "muon"] = "adamw8bit",
     attn_implementation: Literal["flash_attention_2", "sdpa", "eager"] = "flash_attention_2",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
@@ -123,8 +123,8 @@ def run_track1(
         raise ValueError("--micro-batch-size and --grad-accum must be positive")
     if eval_blocks < 1:
         raise ValueError("--eval-blocks must be positive")
-    if optimizer_name not in {"adamw8bit", "adamw_fused"}:
-        raise ValueError("--optimizer-name must be one of: adamw8bit, adamw_fused")
+    if optimizer_name not in {"adamw8bit", "adamw_fused", "muon"}:
+        raise ValueError("--optimizer-name must be one of: adamw8bit, adamw_fused, muon")
     if attn_implementation not in {"flash_attention_2", "sdpa", "eager"}:
         raise ValueError("--attn-implementation must be one of: flash_attention_2, sdpa, eager")
     if not torch.cuda.is_available():
@@ -296,10 +296,71 @@ def run_track1(
         print(f"compiling model with torch.compile(mode={compile_mode!r})", flush=True)
         model = torch.compile(model, dynamic=False, mode=compile_mode)
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    trainable_params = [p for _, p in named_trainable_params]
     trainable_count = sum(p.numel() for p in trainable_params)
     total_count = sum(p.numel() for p in model.parameters())
     print(f"trainable parameters: {trainable_count:,} / {total_count:,}", flush=True)
+
+    class Muon(torch.optim.Optimizer):
+        def __init__(
+            self,
+            params,
+            lr: float,
+            momentum: float = 0.95,
+            weight_decay: float = 0.0,
+            ns_steps: int = 5,
+        ):
+            super().__init__(
+                params,
+                dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps),
+            )
+
+        @staticmethod
+        def zeropower_via_newtonschulz5(grad: torch.Tensor, steps: int) -> torch.Tensor:
+            assert grad.ndim == 2
+            a, b, c = 3.4445, -4.7750, 2.0315
+            x = grad.bfloat16()
+            transposed = x.size(0) > x.size(1)
+            if transposed:
+                x = x.T
+            x = x / (x.norm() + 1.0e-7)
+            for _ in range(steps):
+                xx_t = x @ x.T
+                x = a * x + (b * xx_t + c * (xx_t @ xx_t)) @ x
+            if transposed:
+                x = x.T
+            return x.to(grad.dtype)
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for group in self.param_groups:
+                lr = group["lr"]
+                momentum = group["momentum"]
+                weight_decay = group["weight_decay"]
+                ns_steps = group["ns_steps"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.ndim != 2:
+                        raise RuntimeError("Muon only supports 2D matrix parameters")
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(grad)
+                    buf = state["momentum_buffer"]
+                    buf.lerp_(grad, 1.0 - momentum)
+                    update = grad.lerp(buf, momentum)
+                    update = self.zeropower_via_newtonschulz5(update, ns_steps)
+                    if weight_decay:
+                        p.mul_(1.0 - lr * weight_decay)
+                    scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                    p.add_(update, alpha=-lr * scale)
+            return loss
 
     def make_optimizer():
         if optimizer_name == "adamw8bit":
@@ -312,6 +373,45 @@ def run_track1(
                 eps=1.0e-8,
                 weight_decay=0.1,
             )
+        if optimizer_name == "muon":
+            muon_params: list[torch.nn.Parameter] = []
+            adamw_params: list[torch.nn.Parameter] = []
+            for name, parameter in named_trainable_params:
+                clean_name = name.removeprefix("_orig_mod.")
+                is_embed_or_head = any(part in clean_name for part in ("embed", "lm_head"))
+                if parameter.ndim == 2 and not is_embed_or_head:
+                    muon_params.append(parameter)
+                else:
+                    adamw_params.append(parameter)
+
+            muon = Muon(muon_params, lr=lr, momentum=0.95, weight_decay=0.1)
+            try:
+                import bitsandbytes as bnb
+
+                adamw = bnb.optim.AdamW8bit(
+                    adamw_params,
+                    lr=lr,
+                    betas=(0.9, 0.95),
+                    eps=1.0e-8,
+                    weight_decay=0.1,
+                )
+                adamw_name = "adamw8bit"
+            except Exception as exc:
+                print(f"warning: bitsandbytes AdamW8bit unavailable for Muon tail: {exc}", flush=True)
+                adamw = torch.optim.AdamW(
+                    adamw_params,
+                    lr=lr,
+                    betas=(0.9, 0.95),
+                    eps=1.0e-8,
+                    weight_decay=0.1,
+                )
+                adamw_name = "adamw"
+            print(
+                f"optimizer muon: {len(muon_params)} matrix tensors, "
+                f"{adamw_name}: {len(adamw_params)} non-muon tensors",
+                flush=True,
+            )
+            return [muon, adamw]
         kwargs: dict[str, Any] = {
             "lr": lr,
             "betas": (0.9, 0.95),
@@ -326,11 +426,30 @@ def run_track1(
     optimizer = make_optimizer()
 
     def set_optimizer_lr(lr_value: float) -> None:
+        if isinstance(optimizer, list):
+            for opt in optimizer:
+                for group in opt.param_groups:
+                    group["lr"] = lr_value
+            return
         if hasattr(optimizer, "set_lr"):
             optimizer.set_lr(lr_value)
             return
         for group in optimizer.param_groups:
             group["lr"] = lr_value
+
+    def optimizer_zero_grad() -> None:
+        if isinstance(optimizer, list):
+            for opt in optimizer:
+                opt.zero_grad(set_to_none=True)
+            return
+        optimizer.zero_grad(set_to_none=True)
+
+    def optimizer_step() -> None:
+        if isinstance(optimizer, list):
+            for opt in optimizer:
+                opt.step()
+            return
+        optimizer.step()
 
     @torch.no_grad()
     def evaluate(label: str) -> float:
@@ -374,7 +493,7 @@ def run_track1(
     if compile_warmup:
         print("running untimed train/compile warmup", flush=True)
         model.train()
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_zero_grad()
         for _ in range(grad_accum):
             warmup_batch = next(batch_iter).to(device, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -385,19 +504,19 @@ def run_track1(
                     use_cache=False,
                 ).loss / grad_accum
             warmup_loss.backward()
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_zero_grad()
         torch.cuda.synchronize()
 
     baseline_loss = evaluate("baseline_eval")
     train_start = time.monotonic()
     train_deadline = train_start + minutes * 60.0
-    optimizer.zero_grad(set_to_none=True)
+    optimizer_zero_grad()
 
     step = 0
     tokens = 0
     last_loss = math.nan
     while time.monotonic() < train_deadline:
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_zero_grad()
         accum_losses: list[float] = []
         for _ in range(grad_accum):
             batch = next(batch_iter).to(device, non_blocking=True)
@@ -413,7 +532,7 @@ def run_track1(
         step_lr = lr * step / warmup_steps if warmup_steps > 0 and step <= warmup_steps else lr
         set_optimizer_lr(step_lr)
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-        optimizer.step()
+        optimizer_step()
         last_loss = float(np.mean(accum_losses))
 
         if log_every > 0 and (step == 1 or step % log_every == 0):
