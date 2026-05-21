@@ -196,6 +196,12 @@ rule. This saved v1 snapshot predates the scoring cleanup that moved compile
 and warmup inside the timed budget; future comparable records should run on the
 current trainer.
 
+Default utilization check: run `20260521-214056` used the current auto path
+(`micro_batch_size=8`, `grad_accum=1`, LoRA checkpointing, flex attention,
+`max-autotune-no-cudagraphs`) for a 6 minute compile-in-budget run. It completed
+23 train steps with 753,664 tokens, 10,653 train-loop tok/s, 100% peak sampled
+GPU util, 79.26 GiB peak NVML memory used, and 667 W peak power.
+
 ### Track 1 — 30 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
@@ -296,15 +302,22 @@ Modal image with:
 - `attn_implementation="flex_attention"` by default, with `flash-attn` for FA2 fallback
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
 - `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
+  and auto-resolves to `micro_batch_size=8`, `grad_accum=1`, and checkpointing on H100
 - Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
 - `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
-- LoRA `gradient_checkpointing="auto"` starts without checkpointing and retries the timed warmup with checkpointing if CUDA OOMs
+- LoRA `gradient_checkpointing="auto"` enables checkpointing for multi-sample micro-batches
+  and still retries the timed warmup with checkpointing if CUDA OOMs
 - GPU telemetry in `metrics.jsonl`, including NVML utilization, power, and CUDA
-  allocated/reserved/peak memory when available
+  allocated/reserved/peak memory when available; peak budget-phase util and memory are
+  mirrored into `summary.json` and W&B
 - Optional W&B logging via `--wandb-project`, with `WANDB_API_KEY` forwarded
   from the local environment into the Modal function
 - Optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
+
+The cheap `./run.sh smoke` path pins SDPA/no-compile smoke tests to
+`micro_batch_size=4`; the larger `micro_batch_size=8` default is intended for
+the compiled flex-attention path.
 
 Artifacts are written to the `nanofinetune-cache` Modal volume:
 

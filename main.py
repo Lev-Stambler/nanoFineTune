@@ -30,6 +30,20 @@ DEFAULT_DATASET_ID = "HuggingFaceTB/finemath"
 DEFAULT_DATASET_CONFIG = "finemath-4plus"
 DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
 DEFAULT_EFFECTIVE_TOKENS_PER_STEP = 32_768
+DEFAULT_LORA_MICRO_BATCH_SIZE = 8
+DEFAULT_FULL_MICRO_BATCH_SIZE = 1
+
+PEAK_GPU_STAT_KEYS = {
+    "cuda_max_memory_allocated_gib": "peak_cuda_memory_allocated_gib",
+    "cuda_max_memory_reserved_gib": "peak_cuda_memory_reserved_gib",
+    "cuda_max_memory_allocated_fraction": "peak_cuda_memory_allocated_fraction",
+    "cuda_max_memory_reserved_fraction": "peak_cuda_memory_reserved_fraction",
+    "gpu_utilization_percent": "peak_gpu_utilization_percent",
+    "gpu_memory_utilization_percent": "peak_gpu_memory_utilization_percent",
+    "gpu_memory_used_gib": "peak_gpu_memory_used_gib",
+    "gpu_memory_used_fraction": "peak_gpu_memory_used_fraction",
+    "gpu_power_watts": "peak_gpu_power_watts",
+}
 
 TRACKS: dict[str, dict[str, Any]] = {
     "1": {"name": "30min", "default_minutes": 30.0, "record_dir": "records/track_1_30min"},
@@ -249,7 +263,11 @@ def run_track1(
     requested_micro_batch_size = micro_batch_size
     requested_grad_accum = grad_accum
     if micro_batch_size == 0:
-        micro_batch_size = 1
+        micro_batch_size = (
+            DEFAULT_LORA_MICRO_BATCH_SIZE
+            if tuning_mode == "lora"
+            else DEFAULT_FULL_MICRO_BATCH_SIZE
+        )
     if grad_accum == 0:
         tokens_per_micro_batch = seq_len * micro_batch_size
         grad_accum = max(1, DEFAULT_EFFECTIVE_TOKENS_PER_STEP // tokens_per_micro_batch)
@@ -268,7 +286,8 @@ def run_track1(
         else optimizer_name
     )
     checkpointing_enabled = gradient_checkpointing == "true" or (
-        gradient_checkpointing == "auto" and tuning_mode == "full"
+        gradient_checkpointing == "auto"
+        and (tuning_mode == "full" or (tuning_mode == "lora" and micro_batch_size > 1))
     )
     gradient_checkpointing_fallback_used = False
 
@@ -309,6 +328,7 @@ def run_track1(
     nvml = None
     nvml_handle = None
     nvml_error = ""
+    peak_gpu_stats: dict[str, float] = {}
     try:
         import pynvml
 
@@ -362,6 +382,15 @@ def run_track1(
         elif nvml_error:
             stats["gpu_nvml_init_error"] = nvml_error
         return stats
+
+    def update_peak_gpu_stats(stats: dict[str, Any]) -> None:
+        for source_key, target_key in PEAK_GPU_STAT_KEYS.items():
+            value = stats.get(source_key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            numeric_value = float(value)
+            if math.isfinite(numeric_value):
+                peak_gpu_stats[target_key] = max(peak_gpu_stats.get(target_key, 0.0), numeric_value)
 
     config = {
         "run_id": run_id,
@@ -444,7 +473,9 @@ def run_track1(
 
     def log_metric(record: dict[str, Any], include_gpu: bool = False) -> None:
         if include_gpu:
-            record = {**record, **collect_gpu_stats()}
+            gpu_stats = collect_gpu_stats()
+            update_peak_gpu_stats(gpu_stats)
+            record = {**record, **gpu_stats}
         record = {"time": time.time(), **record}
         with metrics_path.open("a") as f:
             f.write(json.dumps(record, default=_json_default) + "\n")
@@ -867,6 +898,7 @@ def run_track1(
     budget_start = time.monotonic()
     train_deadline = budget_start + minutes * 60.0
     torch.cuda.reset_peak_memory_stats(gpu_index)
+    peak_gpu_stats.clear()
     log_gpu("budget_start")
 
     if compile_model:
@@ -965,6 +997,7 @@ def run_track1(
     final_loss = evaluate("final_eval")
     summary = {
         **config,
+        **peak_gpu_stats,
         "record_date": dt.date.today().isoformat(),
         "run_dir": str(run_dir),
         "eval_cache": str(eval_path),

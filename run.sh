@@ -12,6 +12,7 @@ case "${1:-}" in
     exec "${cmd[@]}" \
       --minutes 0.1 \
       --eval-blocks 2 \
+      --micro-batch-size 4 \
       --grad-accum 1 \
       --no-compile-model \
       --no-compile-warmup \
