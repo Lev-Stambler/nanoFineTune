@@ -70,10 +70,20 @@ Other than that, anything and everything is fair game:
 - Optimizer choice, learning rate schedules, weight decay
 - Batch size, gradient accumulation, sequence length
 - Attention implementation (FA2, FlexAttention, SDPA, etc.)
-- Architecture modifications (freeze layers, add adapters, etc.)
+- Model-aware optimizations that use the underlying architecture, layer layout,
+  parameter shapes, attention/MLP structure, or other implementation details
+- Architecture and trainable-structure changes (freeze layers, add adapters,
+  replace modules, add auxiliary parameters, alter which weights are updated,
+  etc.)
 - Training data ordering, shuffling, document packing strategies
 - Mixed precision, compilation, kernel optimizations
 - Novel training techniques (Muon, value embeddings, etc.)
+
+In other words, the starting checkpoint is fixed, but the trainer does not need
+to treat the model as a black box. Submissions may incorporate knowledge of the
+Qwen3.5 architecture directly into their optimization strategy, provided they do
+not change the fixed input model to a different checkpoint or exploit eval/data
+leakage.
 
 ### Discretionary
 
