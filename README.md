@@ -20,13 +20,17 @@ Higher is better. The timer starts after model load, eval-cache prep,
 optimizer setup, an untimed train-shaped compile warmup, and baseline eval.
 The final eval runs after the timed train loop.
 
+The baseline iteration uses PEFT LoRA by default: all linear language-model
+layers get rank-32 adapters, the base checkpoint stays frozen, and full
+fine-tuning remains available with `--tuning-mode full`.
+
 ## Tracks
 
 | Track | Budget | Default command |
 |-------|--------|-----------------|
-| 1     | 30 min | `modal run main.py` |
-| 2     | 5 min  | `modal run main.py --track 2` |
-| 3     | 2 hr   | `modal run main.py --track 3` |
+| 1     | 30 min | `./run.sh` |
+| 2     | 5 min  | `./run.sh track2` |
+| 3     | 2 hr   | `./run.sh track3` |
 
 Override the budget explicitly with `--minutes` (default 0 = use track
 default).
@@ -85,35 +89,56 @@ All are public and ungated.
 
 ## Quick start
 
-Install and authenticate Modal:
+Install local launcher dependencies and authenticate Modal:
 
 ```bash
-pip install modal
-modal setup
+uv sync
+uv run modal setup
 ```
 
-Launch a 30-minute run (Track 1):
+If Modal is already configured, verify the active profile:
 
 ```bash
-modal run main.py
+uv run modal profile list
 ```
 
 Short smoke test:
 
 ```bash
-modal run main.py --minutes 0.1 --eval-blocks 2 --grad-accum 1
+./run.sh smoke
+```
+
+This uses the fastest path: short budget, two eval blocks, SDPA attention, and
+no model compile or compile warmup.
+
+Full fine-tune compatibility smoke test:
+
+```bash
+./run.sh full-smoke
+```
+
+Compiled full fine-tune smoke test:
+
+```bash
+./run.sh full-compile-smoke
+```
+
+Launch a 30-minute run (Track 1):
+
+```bash
+./run.sh
 ```
 
 5-minute sprint (Track 2):
 
 ```bash
-modal run main.py --track 2
+./run.sh track2
 ```
 
 2-hour endurance (Track 3):
 
 ```bash
-modal run main.py --track 3
+./run.sh track3
 ```
 
 ## Submitting a record
@@ -121,18 +146,19 @@ modal run main.py --track 3
 Run with `--record-description` and `--record-contributors`:
 
 ```bash
-modal run main.py \
+./run.sh \
   --record-description "MuonOptimizer" \
   --record-contributors "@yourhandle"
 ```
 
-This automatically saves a record folder under `records/track_N_<budget>/`
-containing:
+This saves a local record folder under `records/track_N_<budget>/` after the
+Modal run returns. The folder contains:
 
 - `main.py` — full source code snapshot (like modded-nanogpt)
 - `config.json` — all hyperparameters
 - `summary.json` — full run metrics
 - `record.txt` — human-readable summary
+- `metrics.jsonl` — event log from the run
 
 Open a PR with the new record folder. The PR should:
 
@@ -147,7 +173,7 @@ Open a PR with the new record folder. The PR should:
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
-| 1 | — | Baseline run (AdamW8bit, lr=2e-5, seq=4096) | — | — | — |
+| 1 | — | LoRA baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096) | — | — | — |
 
 ### Track 2 — 5 minutes
 
@@ -164,42 +190,70 @@ Open a PR with the new record folder. The PR should:
 ## Useful flags
 
 ```bash
-modal run main.py --minutes 30 --seq-len 4096 --micro-batch-size 1 --grad-accum 8
+./run.sh --minutes 30 --seq-len 4096 --micro-batch-size 1 --grad-accum 8
+```
+
+Tuning modes:
+
+```bash
+./run.sh --tuning-mode lora
+./run.sh --tuning-mode full
+```
+
+LoRA baseline knobs:
+
+```bash
+./run.sh --lora-r 32 --lora-alpha 64 --lora-target-modules all-linear
+./run.sh --gradient-checkpointing true
+./run.sh --gradient-checkpointing false
 ```
 
 Optimizer choices:
 
 ```bash
-modal run main.py --optimizer-name adamw8bit
-modal run main.py --optimizer-name adamw_fused
-modal run main.py --optimizer-name muon
+./run.sh --optimizer-name auto
+./run.sh --optimizer-name adamw8bit
+./run.sh --optimizer-name adamw_fused
+./run.sh --optimizer-name muon
 ```
 
 Attention backends or disable compile:
 
 ```bash
-modal run main.py --attn-implementation flash_attention_2
-modal run main.py --attn-implementation sdpa --compile-model false
+./run.sh --attn-implementation flash_attention_2
+./run.sh --attn-implementation sdpa --no-compile-model
 ```
 
 Save final weights:
 
 ```bash
-modal run main.py --save-final
+./run.sh --save-final
 ```
+
+In LoRA mode, `--save-final` writes adapter weights. In full mode, it writes
+the full model.
 
 ## Architecture
 
-`main.py` is the only training source file. It builds a Modal image with:
+`main.py` is the canonical training source file. Like modded-nanogpt, new
+optimization attempts should directly edit the current trainer. Accepted
+records preserve source snapshots under `records/` so old runs remain
+reproducible after the trainer evolves.
+
+The local launcher uses `uv` (`pyproject.toml`, `uv.lock`) and `run.sh`. The
+remote training environment is still defined inside `main.py`, which builds a
+Modal image with:
 
 - Current Hugging Face Transformers for Qwen3.5 support
 - NVIDIA CUDA devel base image so source-built CUDA extensions have `nvcc`
 - H100 CUDA build env defaults, including `TORCH_CUDA_ARCH_LIST=9.0`
 - `attn_implementation="flex_attention"` by default, with `flash-attn` for FA2 fallback
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
+- `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
 - Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
 - `torch.compile(..., dynamic=False)` plus an untimed train-shaped compile warmup
-- `bitsandbytes` `AdamW8bit` by default
+- `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
+- LoRA `gradient_checkpointing="auto"` starts without checkpointing and retries the untimed warmup with checkpointing if CUDA OOMs
 - Optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
 
 Artifacts are written to the `nanocpt-cache` Modal volume:
@@ -208,6 +262,10 @@ Artifacts are written to the `nanocpt-cache` Modal volume:
 - `/cache/runs/<run_id>/metrics.jsonl`
 - `/cache/runs/<run_id>/summary.json`
 - `/cache/eval/<hash>.pt` for the deterministic fixed eval blocks
+
+When `--record-description` is provided, `main.py` also returns the source,
+config, summary, record text, and metrics log to the local entrypoint, which
+writes the canonical `records/` snapshot in this repository.
 
 ## Scoring detail
 
