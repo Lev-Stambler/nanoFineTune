@@ -47,9 +47,7 @@ OPTIMIZER_CHOICES = {
 }
 LR_SCHEDULE_CHOICES = {"constant", "wsd"}
 MUON_LR_ADJUSTMENT_CHOICES = {"original", "match_rms_adamw"}
-LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal", "lora_ga"}
-LORA_GA_DIRECTION_CHOICES = {"ArBr", "A2rBr", "ArB2r", "random"}
-LORA_GA_SCALE_CHOICES = {"stable", "weight_svd", "gd_scale", "unit"}
+LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal"}
 
 PEAK_GPU_STAT_KEYS = {
     "cuda_max_memory_allocated_gib": "peak_cuda_memory_allocated_gib",
@@ -211,12 +209,6 @@ def run_track1(
     lora_init: str = "default",
     lora_eva_rho: float = DEFAULT_LORA_EVA_RHO,
     lora_eva_batches: int = 16,
-    lora_ga_batches: int = 4,
-    lora_ga_micro_batch_size: int = 1,
-    lora_ga_direction: str = "ArB2r",
-    lora_ga_scale: str = "stable",
-    lora_ga_stable_gamma: int = 16,
-    lora_ga_cache: bool = False,
     loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
     loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: Literal["original", "match_rms_adamw"] = "match_rms_adamw",
@@ -297,9 +289,7 @@ def run_track1(
         raise ValueError("--lora-alpha must be positive")
     if lora_dropout < 0.0 or lora_dropout >= 1.0:
         raise ValueError("--lora-dropout must be in [0, 1)")
-    lora_init = str(lora_init).lower().replace("-", "_")
-    if lora_init == "loraga":
-        lora_init = "lora_ga"
+    lora_init = str(lora_init).lower()
     if lora_init.startswith("pissa_niter_"):
         try:
             pissa_iters = int(lora_init.removeprefix("pissa_niter_"))
@@ -316,25 +306,6 @@ def run_track1(
         raise ValueError("--lora-eva-rho must be >= 1.0")
     if lora_eva_batches < 1:
         raise ValueError("--lora-eva-batches must be positive")
-    if lora_ga_batches < 1:
-        raise ValueError("--lora-ga-batches must be positive")
-    if lora_ga_micro_batch_size < 1:
-        raise ValueError("--lora-ga-micro-batch-size must be positive")
-    direction_lookup = {value.lower(): value for value in LORA_GA_DIRECTION_CHOICES}
-    lora_ga_direction = direction_lookup.get(str(lora_ga_direction).lower(), lora_ga_direction)
-    if lora_ga_direction not in LORA_GA_DIRECTION_CHOICES:
-        raise ValueError(
-            "--lora-ga-direction must be one of: "
-            f"{', '.join(sorted(LORA_GA_DIRECTION_CHOICES))}"
-        )
-    lora_ga_scale = str(lora_ga_scale).lower()
-    if lora_ga_scale not in LORA_GA_SCALE_CHOICES:
-        raise ValueError(
-            "--lora-ga-scale must be one of: "
-            f"{', '.join(sorted(LORA_GA_SCALE_CHOICES))}"
-        )
-    if lora_ga_stable_gamma < 1:
-        raise ValueError("--lora-ga-stable-gamma must be positive")
     if loraplus_lr_ratio < 1.0:
         raise ValueError("--loraplus-lr-ratio must be >= 1.0")
     if loraplus_lr_embedding <= 0.0:
@@ -361,7 +332,7 @@ def run_track1(
         raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
     if optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"} and tuning_mode != "lora":
         raise ValueError(f"--optimizer-name {optimizer_name} requires --tuning-mode lora")
-    if lora_init in {"eva", "lora_ga"} and tuning_mode != "lora":
+    if lora_init == "eva" and tuning_mode != "lora":
         raise ValueError(f"--lora-init {lora_init} requires --tuning-mode lora")
     if lora_use_dora and tuning_mode != "lora":
         raise ValueError("--lora-use-dora requires --tuning-mode lora")
@@ -436,31 +407,6 @@ def run_track1(
     run_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
-    lora_ga_cache_file = None
-    if tuning_mode == "lora" and lora_init == "lora_ga" and lora_ga_cache:
-        lora_ga_cache_payload = {
-            "model": model_id,
-            "model_revision": model_revision,
-            "dataset": dataset_id,
-            "dataset_config": dataset_config,
-            "dataset_revision": dataset_revision,
-            "seq_len": seq_len,
-            "eval_blocks": eval_blocks,
-            "seed": seed,
-            "lora_r": lora_r,
-            "lora_alpha": lora_alpha,
-            "lora_target_modules": lora_target_modules,
-            "lora_use_rslora": lora_use_rslora,
-            "lora_ga_batches": lora_ga_batches,
-            "lora_ga_micro_batch_size": lora_ga_micro_batch_size,
-            "lora_ga_direction": lora_ga_direction,
-            "lora_ga_scale": lora_ga_scale,
-            "lora_ga_stable_gamma": lora_ga_stable_gamma,
-        }
-        lora_ga_cache_key = hashlib.sha256(
-            json.dumps(lora_ga_cache_payload, sort_keys=True).encode()
-        ).hexdigest()[:20]
-        lora_ga_cache_file = str(CACHE_MOUNT / "loraga" / f"{lora_ga_cache_key}.pt")
 
     bytes_per_gib = 1024**3
     gpu_index = torch.cuda.current_device()
@@ -578,13 +524,6 @@ def run_track1(
         "lora_init": lora_init if tuning_mode == "lora" else None,
         "lora_eva_rho": lora_eva_rho if tuning_mode == "lora" else None,
         "lora_eva_batches": lora_eva_batches if tuning_mode == "lora" else None,
-        "lora_ga_batches": lora_ga_batches if tuning_mode == "lora" else None,
-        "lora_ga_micro_batch_size": lora_ga_micro_batch_size if tuning_mode == "lora" else None,
-        "lora_ga_direction": lora_ga_direction if tuning_mode == "lora" else None,
-        "lora_ga_scale": lora_ga_scale if tuning_mode == "lora" else None,
-        "lora_ga_stable_gamma": lora_ga_stable_gamma if tuning_mode == "lora" else None,
-        "lora_ga_cache": lora_ga_cache if tuning_mode == "lora" else None,
-        "lora_ga_cache_file": lora_ga_cache_file if tuning_mode == "lora" else None,
         "loraplus_lr_ratio": loraplus_lr_ratio,
         "loraplus_lr_embedding": loraplus_lr_embedding,
         "muon_lr_adjustment": muon_lr_adjustment,
@@ -748,26 +687,6 @@ def run_track1(
             return value
         return [part.strip() for part in value.split(",") if part.strip()]
 
-    def expand_all_linear_target_modules(
-        current_model: torch.nn.Module,
-        minimum_dimension: int = 1,
-    ) -> tuple[list[str], int]:
-        modules: list[str] = []
-        skipped_small = 0
-        for name, module in current_model.named_modules():
-            if not name or "lm_head" in name:
-                continue
-            if name == "visual" or ".visual." in name or name.endswith(".visual"):
-                continue
-            if isinstance(module, torch.nn.Linear):
-                if min(module.weight.shape) < minimum_dimension:
-                    skipped_small += 1
-                    continue
-                modules.append(name)
-        if not modules:
-            raise RuntimeError("could not expand all-linear LoRA targets for LoRA-GA")
-        return modules, skipped_small
-
     def disable_model_cache(current_model: torch.nn.Module) -> None:
         if hasattr(current_model, "config"):
             current_model.config.use_cache = False
@@ -797,28 +716,6 @@ def run_track1(
         if hasattr(current_model, "gradient_checkpointing_disable"):
             current_model.gradient_checkpointing_disable()
 
-    def train_batches(batch_size: int | None = None):
-        active_batch_size = micro_batch_size if batch_size is None else batch_size
-        ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
-        token_buffer: list[int] = []
-        batch: list[torch.Tensor] = []
-        while True:
-            for row in ds:
-                text = row.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    continue
-                token_buffer.extend(tokenize_text(text))
-                while len(token_buffer) >= seq_len:
-                    block = torch.tensor(token_buffer[:seq_len], dtype=torch.long)
-                    del token_buffer[:seq_len]
-                    batch.append(block)
-                    if len(batch) == active_batch_size:
-                        yield torch.stack(batch)
-                        batch.clear()
-            ds = dataset_stream(shuffle=True).skip(train_skip_docs)
-
-    device = torch.device("cuda")
-
     print("loading model", flush=True)
     model = ModelClass.from_pretrained(
         model_id,
@@ -835,8 +732,6 @@ def run_track1(
         from peft import LoraConfig, TaskType, get_peft_model
         if lora_init == "eva":
             from peft import EvaConfig
-        if lora_init == "lora_ga":
-            from peft import LoraGAConfig, preprocess_loraga
 
         print(
             "applying LoRA "
@@ -846,20 +741,9 @@ def run_track1(
             flush=True,
         )
         lora_init_value: bool | str = True if lora_init == "default" else lora_init
-        parsed_lora_target_modules = parse_lora_target_modules(lora_target_modules)
-        if lora_init == "lora_ga" and parsed_lora_target_modules == "all-linear":
-            parsed_lora_target_modules, skipped_small = expand_all_linear_target_modules(
-                model,
-                minimum_dimension=2 * lora_r,
-            )
-            print(
-                f"expanded all-linear to {len(parsed_lora_target_modules)} LoRA-GA target modules "
-                f"(skipped {skipped_small} modules with min dimension < {2 * lora_r})",
-                flush=True,
-            )
         lora_config_kwargs: dict[str, Any] = {
             "task_type": TaskType.CAUSAL_LM,
-            "target_modules": parsed_lora_target_modules,
+            "target_modules": parse_lora_target_modules(lora_target_modules),
             "exclude_modules": r".*(visual|lm_head).*",
             "r": lora_r,
             "lora_alpha": lora_alpha,
@@ -872,48 +756,12 @@ def run_track1(
         }
         if lora_init == "eva":
             lora_config_kwargs["eva_config"] = EvaConfig(rho=lora_eva_rho)
-        if lora_init == "lora_ga":
-            lora_config_kwargs["lora_ga_config"] = LoraGAConfig(
-                direction=lora_ga_direction,
-                scale=lora_ga_scale,
-                stable_gamma=lora_ga_stable_gamma,
-            )
         lora_config = LoraConfig(**lora_config_kwargs)
-        if lora_init == "lora_ga":
-            model.to(device)
-            set_gradient_checkpointing(model, checkpointing_enabled)
-            log_gpu("before_loraga_preprocess")
-            loraga_batch_iter = train_batches(batch_size=lora_ga_micro_batch_size)
-
-            def loraga_train_step() -> None:
-                model.zero_grad(set_to_none=True)
-                for _ in range(lora_ga_batches):
-                    batch = next(loraga_batch_iter).to(device, non_blocking=True)
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        output = model(
-                            input_ids=batch,
-                            attention_mask=torch.ones_like(batch, dtype=torch.long),
-                            labels=batch,
-                            use_cache=False,
-                        )
-                        loss = output.loss / lora_ga_batches
-                    loss.backward()
-
-            print(
-                "preprocessing LoRA-GA "
-                f"batches={lora_ga_batches} micro_batch_size={lora_ga_micro_batch_size} "
-                f"direction={lora_ga_direction} scale={lora_ga_scale} "
-                f"cache={'on' if lora_ga_cache_file else 'off'}",
-                flush=True,
-            )
-            preprocess_loraga(model, lora_config, loraga_train_step, cache_file=lora_ga_cache_file)
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            log_gpu("after_loraga_preprocess")
         model = get_peft_model(model, lora_config, low_cpu_mem_usage=(lora_init == "eva"))
 
     set_gradient_checkpointing(model, checkpointing_enabled)
 
+    device = torch.device("cuda")
     model.to(device)
     if tuning_mode == "lora" and lora_init == "eva":
         from peft import initialize_lora_eva_weights
@@ -1228,6 +1076,25 @@ def run_track1(
         set_visual_eval(model)
         return loss
 
+    def train_batches():
+        ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
+        token_buffer: list[int] = []
+        batch: list[torch.Tensor] = []
+        while True:
+            for row in ds:
+                text = row.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                token_buffer.extend(tokenize_text(text))
+                while len(token_buffer) >= seq_len:
+                    block = torch.tensor(token_buffer[:seq_len], dtype=torch.long)
+                    del token_buffer[:seq_len]
+                    batch.append(block)
+                    if len(batch) == micro_batch_size:
+                        yield torch.stack(batch)
+                        batch.clear()
+            ds = dataset_stream(shuffle=True).skip(train_skip_docs)
+
     batch_iter = train_batches()
 
     def is_cuda_oom(exc: BaseException) -> bool:
@@ -1459,12 +1326,6 @@ def main(
     lora_init: str = "default",
     lora_eva_rho: float = DEFAULT_LORA_EVA_RHO,
     lora_eva_batches: int = 16,
-    lora_ga_batches: int = 4,
-    lora_ga_micro_batch_size: int = 1,
-    lora_ga_direction: str = "ArB2r",
-    lora_ga_scale: str = "stable",
-    lora_ga_stable_gamma: int = 16,
-    lora_ga_cache: bool = False,
     loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
     loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: str = "match_rms_adamw",
@@ -1527,12 +1388,6 @@ def main(
         lora_init=lora_init,
         lora_eva_rho=lora_eva_rho,
         lora_eva_batches=lora_eva_batches,
-        lora_ga_batches=lora_ga_batches,
-        lora_ga_micro_batch_size=lora_ga_micro_batch_size,
-        lora_ga_direction=lora_ga_direction,
-        lora_ga_scale=lora_ga_scale,
-        lora_ga_stable_gamma=lora_ga_stable_gamma,
-        lora_ga_cache=lora_ga_cache,
         loraplus_lr_ratio=loraplus_lr_ratio,
         loraplus_lr_embedding=loraplus_lr_embedding,
         muon_lr_adjustment=muon_lr_adjustment,  # type: ignore[arg-type]

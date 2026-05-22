@@ -200,6 +200,9 @@ moved compile and warmup inside the timed budget.
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
+| v5 | -0.064841 | LoRA-GA AdamW WSD (`lora_ga`, 1 init batch, cache on, lr=5e-5, mb8/grad1, flex, max-autotune-no-cudagraphs); 506 steps, 16.58M tokens, 9208.7 budget tok/s, 10927.9 train-loop tok/s, 100% peak sampled GPU util, peak NVML 64.91 GiB | 2026-05-22 | [summary](records/track_1_30min/2026-05-22_v5_LoRA-GA_AdamW_WSD_lr5e-5/summary.json) | — |
+| v4 | -0.469354 | LoRA+ PiSSA WSD lower LR (`loraplus_adamw`, ratio 16, lr=5e-5, mb8/grad1, flex, max-autotune-no-cudagraphs); 498 steps, 16.32M tokens, 9063.8 budget tok/s, 10846.9 train-loop tok/s, 100% peak sampled GPU util, peak NVML 66.88 GiB | 2026-05-22 | [summary](records/track_1_30min/2026-05-22_v4_LoRA_PiSSA_WSD_lr5e-5/summary.json) | — |
+| v3 | -0.860189 | LoRA+ PiSSA WSD (`loraplus_adamw`, ratio 16, lr=1e-4, mb8/grad1, flex, max-autotune-no-cudagraphs); 469 steps, 15.37M tokens, 8529.7 budget tok/s, 10554.6 train-loop tok/s, 100% peak sampled GPU util | 2026-05-22 | [summary](records/track_1_30min/2026-05-22_v3_LoRA_PiSSA_WSD/summary.json) | — |
 | v2 | -0.050513 | LoRA default util baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096, mb8/grad1, eval mb2, max-autotune-no-cudagraphs); 491 steps, 16.09M tokens, 8936.5 budget tok/s, 10727.2 train-loop tok/s, 100% peak sampled GPU util | 2026-05-21 | [summary](records/track_1_30min/2026-05-21_v2_LoRA_mb8_Track_1_30min_default_util/summary.json) | — |
 | v1 | -0.050743 | LoRA baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096, max-autotune-no-cudagraphs); 488 steps, 15.99M tokens, 8872.6 tok/s | 2026-05-21 | [summary](records/track_1_30min/2026-05-21_v1_LoRA_Track_1_30min_compiled_baseline/summary.json) | — |
 
@@ -240,6 +243,7 @@ LoRA baseline knobs:
 ./run.sh --lora-init pissa_niter_4
 ./run.sh --lora-init olora
 ./run.sh --lora-init eva --lora-eva-batches 16
+./run.sh --lora-init lora_ga --lora-ga-batches 4 --lora-ga-micro-batch-size 1
 ./run.sh --lora-use-dora
 ./run.sh --gradient-checkpointing true
 ./run.sh --gradient-checkpointing false
@@ -295,6 +299,44 @@ are mirrored to W&B.
 
 ## Iteration Notes
 
+### 2026-05-22 LoRA-GA/latest LoRA follow-up
+
+Current stable PEFT in the Modal image (`peft==0.19.1`) exposes LoRA-GA via
+`LoraGAConfig` and `preprocess_loraga`, so the trainer now supports:
+
+```bash
+./run.sh --lora-init lora_ga \
+  --lora-ga-batches 4 \
+  --lora-ga-micro-batch-size 1 \
+  --optimizer-name loraplus_adamw --loraplus-lr-ratio 16 --lr 5e-5 \
+  --lr-schedule wsd
+```
+
+LoRA-GA estimates full-weight gradients on a small training sample before
+adapter injection and uses those gradients to initialize the low-rank adapters.
+The default estimate uses 4 single-sample 4096-token batches to keep memory
+bounded on H100; `--lora-ga-cache` can persist the large gradient cache on the
+Modal volume for repeated exact reruns.
+
+Validation: the one-step LoRA-GA smoke passed with SDPA/no-compile after
+filtering unsupported small linears, and v5 completed the full 30-minute
+flex-attention compile path with W&B offline logging enabled. v5 had a strong
+systems profile, but final eval loss still worsened from `1.431297` to
+`1.496138`, so LoRA-GA remains an experimental option rather than the default.
+
+The latest PEFT `main` docs also show source-only fields such as
+`velora_config` and `monteclora_config`; those are not wired into this baseline
+until we intentionally move the image off the pinned stable PEFT release. The
+May 2026 LoRA literature includes Hybrid-LoRA, but that is a hybrid full-tune
+module-selection method rather than a drop-in PEFT LoRA initializer, so it is a
+separate experiment from this LoRA-GA path.
+
+Sources checked: [PEFT main LoRA reference](https://huggingface.co/docs/peft/main/package_reference/lora),
+[LoRA-GA paper](https://arxiv.org/abs/2407.05000),
+[ID-LoRA](https://arxiv.org/abs/2602.20727),
+[Unified LoRA variants study](https://arxiv.org/abs/2601.22708), and
+[Hybrid-LoRA](https://arxiv.org/abs/2605.18822).
+
 ### 2026-05-22 optimizer and LoRA variant pass
 
 The v2 utilization run fixed the GPU side but still worsened eval loss, so this
@@ -330,11 +372,16 @@ Validation results:
 | `2026-05-22_smoke_Muon_RMS_PiSSA_WSD` | Muon RMS, PiSSA, WSD, SDPA/no-compile | Passed one train step; peak util 100%, peak NVML 67.34 GiB. |
 | `2026-05-22_compile_smoke_LoRA_flex_WSD` | LoRA+ AdamW, flex attention, `max-autotune-no-cudagraphs` | Compile and warmup passed; 1-minute budget was consumed before train steps. |
 | `2026-05-22_v3_LoRA_PiSSA_WSD` | Full 30-minute Track 1, default LoRA batch, flex compile | 469 steps, 15.37M tokens, 8,529.7 budget tok/s, 10,554.6 train-loop tok/s, peak util 100%, peak NVML 63.70 GiB, eval loss worsened by 0.8602. |
+| `2026-05-22_v4_LoRA_PiSSA_WSD_lr5e-5` | Full 30-minute Track 1, LoRA+ base LR lowered to `5e-5`, flex compile | 498 steps, 16.32M tokens, 9,063.8 budget tok/s, 10,846.9 train-loop tok/s, peak util 100%, peak NVML 66.88 GiB, eval loss worsened by 0.4694. |
+| `2026-05-22_smoke_LoRA-GA_AdamW_WSD_lr5e-5` | LoRA-GA AdamW, WSD, SDPA/no-compile | Passed one train step after expanding `all-linear` to valid LoRA-GA modules; peak util 94%, peak NVML 72.17 GiB, eval loss improved by 0.0056 on the tiny smoke eval. |
+| `2026-05-22_v5_LoRA-GA_AdamW_WSD_lr5e-5` | Full 30-minute Track 1, LoRA-GA AdamW, flex compile, W&B offline | 506 steps, 16.58M tokens, 9,208.7 budget tok/s, 10,927.9 train-loop tok/s, peak util 100%, peak NVML 64.91 GiB, eval loss worsened by 0.0648. |
 
 Conclusion: keep the v2 default (`optimizer_name=auto` -> fused AdamW,
 `micro_batch_size=8`, flex attention, `max-autotune-no-cudagraphs`). The new
-LoRA+/Muon/PiSSA/WSD paths compile and run, but LoRA+ ratio 16 at base LR
-`1e-4` is not a quality baseline for this task.
+LoRA+/Muon/PiSSA/WSD and LoRA-GA paths compile and run with good GPU
+utilization, but none beat the default quality baseline yet. LoRA+ ratio 16 is
+not a quality baseline for this task at either `1e-4` or `5e-5`; LoRA-GA is the
+best of this pass but still negative on the 30-minute eval.
 
 Recommended next 30 minute runs:
 
@@ -346,6 +393,11 @@ uv run modal run main.py --minutes 30 --optimizer-name loraplus_adamw \
 uv run modal run main.py --minutes 30 --optimizer-name muon \
   --muon-lr-adjustment match_rms_adamw --lr 2e-4 --lora-init pissa_niter_4 \
   --lr-schedule wsd --record-description "v4 Muon RMS PiSSA WSD lr2e-4"
+
+uv run modal run main.py --minutes 30 --optimizer-name auto --lr 2e-5 \
+  --lora-init lora_ga --lora-ga-batches 4 --lora-ga-micro-batch-size 1 \
+  --lora-ga-cache --lr-schedule wsd \
+  --record-description "v6 LoRA-GA AdamW WSD lr2e-5 batches4"
 ```
 
 ## Architecture
@@ -366,7 +418,7 @@ Modal image with:
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
 - `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
   and auto-resolves to `micro_batch_size=8`, `grad_accum=1`, and checkpointing on H100
-- LoRA variant knobs for rsLoRA, DoRA, PiSSA/OLoRA/EVA/orthogonal initialization,
+- LoRA variant knobs for rsLoRA, DoRA, PiSSA/OLoRA/EVA/LoRA-GA/orthogonal initialization,
   LoRA+, and LoRA-FA
 - Eval uses a separate auto micro-batch cap of 2 blocks so the default training
   batch does not OOM the full 64-block eval loss/logits path

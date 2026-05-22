@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: smoke LoRA-GA AdamW WSD lr5e-5
+Contributors:
+Date: 2026-05-22
+Minutes: 0.1
+Eval loss drop: 0.005574
+Baseline eval loss: 1.771812
+Final eval loss: 1.766237
+Steps: 1
+Tokens: 16,384
+Elapsed budget: 43.0s
+Budget tokens/sec: 381
+Train-loop elapsed: 43.0s
+Train-loop tokens/sec: 381

@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: v4 LoRA+ PiSSA WSD lr5e-5
+Contributors:
+Date: 2026-05-22
+Minutes: 30.0
+Eval loss drop: -0.469354
+Baseline eval loss: 1.431308
+Final eval loss: 1.900663
+Steps: 498
+Tokens: 16,318,464
+Elapsed budget: 1800.4s
+Budget tokens/sec: 9064
+Train-loop elapsed: 1504.4s
+Train-loop tokens/sec: 10847
