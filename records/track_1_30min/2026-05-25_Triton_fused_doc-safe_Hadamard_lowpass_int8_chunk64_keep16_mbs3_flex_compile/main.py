@@ -120,14 +120,7 @@ def _write_local_record(summary: dict[str, Any], artifacts: dict[str, str]) -> P
         record_dir = record_dir.with_name(f"{record_dir.name}_{summary['run_id']}")
     record_dir.mkdir(parents=True, exist_ok=False)
 
-    for filename in (
-        "main.py",
-        "activation_filter_kernels.py",
-        "config.json",
-        "summary.json",
-        "record.txt",
-        "metrics.jsonl",
-    ):
+    for filename in ("main.py", "config.json", "summary.json", "record.txt", "metrics.jsonl"):
         content = artifacts.get(filename)
         if not content and filename == "main.py":
             content = Path(__file__).read_text()
@@ -1659,9 +1652,6 @@ def run_track1(
         src_path = Path(__file__).resolve()
         record_artifacts = {
             "main.py": src_path.read_text() if src_path.exists() else "",
-            "activation_filter_kernels.py": (src_path.parent / "activation_filter_kernels.py").read_text()
-            if (src_path.parent / "activation_filter_kernels.py").exists()
-            else "",
             "config.json": json.dumps(config, indent=2, default=_json_default) + "\n",
             "summary.json": json.dumps(summary, indent=2, default=_json_default) + "\n",
             "record.txt": _format_record_text(summary),

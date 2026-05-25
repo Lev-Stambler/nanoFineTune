@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: Triton fused doc-safe Hadamard lowpass int8 chunk64 keep16 mbs3 flex compile
+Contributors: 
+Date: 2026-05-25
+Minutes: 30.0
+Eval loss drop: 0.000580
+Baseline eval loss: 1.431231
+Final eval loss: 1.430651
+Steps: 1511
+Tokens: 18,567,168
+Elapsed budget: 1800.4s
+Budget tokens/sec: 10313
+Train-loop elapsed: 1713.0s
+Train-loop tokens/sec: 10839
