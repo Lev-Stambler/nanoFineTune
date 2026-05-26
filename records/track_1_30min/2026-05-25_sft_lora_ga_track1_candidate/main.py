@@ -1,4 +1,4 @@
-"""nanoFineTune: a Modal H100 speedrun for fine-tuning.
+"""modded-continued-training: a Modal H100 speedrun for fine-tuning.
 
 Track 1 trains Qwen3.5-4B-Base on Hermes tool-calling SFT data by default and
 scores the run by the drop in heldout assistant-only loss. The legacy FineMath
@@ -21,7 +21,7 @@ from typing import Any, Literal
 import modal
 
 
-APP_NAME = "nanofinetune"
+APP_NAME = "modded-continued-training"
 CACHE_MOUNT = Path("/cache")
 HF_CACHE = CACHE_MOUNT / "huggingface"
 
@@ -171,7 +171,7 @@ def _supervised_token_count(labels) -> int:
 
 
 app = modal.App(APP_NAME)
-cache_volume = modal.Volume.from_name("nanofinetune-cache", create_if_missing=True)
+cache_volume = modal.Volume.from_name("modded-continued-training-cache", create_if_missing=True)
 wandb_secret_values = {"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")}
 if os.environ.get("WANDB_BASE_URL"):
     wandb_secret_values["WANDB_BASE_URL"] = os.environ["WANDB_BASE_URL"]
@@ -2115,7 +2115,7 @@ def main(
     record_description: str = "",
     record_contributors: str = "",
 ) -> None:
-    """Run a nanoFineTune track on Modal.
+    """Run a modded-continued-training track on Modal.
 
     --track selects the competition track (1=30min, 2=5min, 3=2hr).
     When --minutes is 0 (default), the track's default budget is used.

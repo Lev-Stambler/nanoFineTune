@@ -1,5 +1,5 @@
 [project]
-name = "nanofinetune"
+name = "modded-continued-training"
 version = "0.1.0"
 description = "Single-H100 fine-tuning speedrun on Modal."
 readme = "README.md"

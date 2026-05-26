@@ -1,4 +1,4 @@
-# nanoFineTune
+# modded-continued-training
 
 Competitive single-H100 fine-tuning speedrun on Modal.
 
@@ -6,7 +6,7 @@ Inspired by [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded
 
 ## What
 
-nanoFineTune measures how far a pretrained language model's heldout eval loss
+modded-continued-training measures how far a pretrained language model's heldout eval loss
 can drop during a fixed wall-clock fine-tuning window on a single H100 GPU.
 
 The current Track 1 default starts from `Qwen/Qwen3.5-4B-Base`, uses packed
@@ -369,7 +369,7 @@ Weights & Biases logging is opt-in:
 ```bash
 export WANDB_API_KEY=...
 ./run.sh track1 \
-  --wandb-project nanofinetune \
+  --wandb-project modded-continued-training \
   --wandb-tags lora,v1,track1
 ```
 
@@ -548,7 +548,7 @@ The cheap `./run.sh smoke` path pins SDPA/no-compile smoke tests to
 `micro_batch_size=4`; the larger `micro_batch_size=8` default is intended for
 the compiled flex-attention path.
 
-Artifacts are written to the `nanofinetune-cache` Modal volume:
+Artifacts are written to the `modded-continued-training-cache` Modal volume:
 
 - `/cache/runs/<run_id>/config.json`
 - `/cache/runs/<run_id>/metrics.jsonl`

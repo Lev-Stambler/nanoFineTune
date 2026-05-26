@@ -62,7 +62,7 @@
   "compile_warmup": true,
   "save_final": false,
   "wandb_enabled": true,
-  "wandb_project": "nanofinetune",
+  "wandb_project": "modded-continued-training",
   "wandb_entity": "",
   "wandb_name": "",
   "wandb_group": "",

@@ -277,7 +277,7 @@ wheels = [
 ]
 
 [[package]]
-name = "nanofinetune"
+name = "modded-continued-training"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
