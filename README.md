@@ -10,17 +10,18 @@ modded-continued-training measures how far a pretrained language model's heldout
 can drop during a fixed wall-clock fine-tuning window on a single H100 GPU.
 
 The current Track 1 default starts from `Qwen/Qwen3.5-4B-Base`, uses packed
-assistant-only tool-calling SFT on `NousResearch/hermes-function-calling-v1`
-(`func_calling_singleturn`), and is scored by:
+assistant-only general chat SFT on `HuggingFaceH4/ultrachat_200k`
+(`train_sft`), and is scored by:
 
 ```
 score = baseline_eval_loss − final_eval_loss
 ```
 
 Higher is better. The timer starts after model load, eval-cache prep,
-optimizer setup, and baseline eval. Compilation, graph capture, autotuning, and
-train-shaped warmup all consume the selected track budget. The final eval runs
-after the timed train loop.
+optimizer setup, baseline eval, and `torch.compile` + train-shaped warmup
+(which run as an untimed prologue, matching modded-nanogpt). The final eval
+also runs after the timed train loop. The untimed compile/warmup duration is
+recorded as `elapsed_compile_warmup_seconds` in `summary.json`.
 
 The baseline iteration uses PEFT GraLoRA by default: all linear language-model
 layers get rank-32 adapters with `--gralora-k 2`, the base checkpoint stays
@@ -65,9 +66,24 @@ Legacy CPT records must:
    that the mean eval loss drop is positive.
 5. **Run on a single H100 via Modal.** The hardware is fixed. The run must use
    the Modal image defined in `main.py`.
-6. **Count compilation work against the track budget.** `torch.compile`,
-   graph capture, autotuning, recompilation, and train-shaped compile warmup
-   are allowed, but they consume the same timed budget as training.
+6. **Compilation and warmup are untimed, but constrained.** `torch.compile`,
+   autotune, graph capture, recompilation, and train-shaped warmup all run
+   *before* the timed budget starts and do not consume it (matching
+   modded-nanogpt). To prevent trading unbounded untimed compile for small
+   timed gains, you may **not**:
+   - set extra `torch._inductor.config` flags beyond defaults,
+   - pass extra keyword arguments to `torch.compile` beyond `mode` (selected
+     via `--compile-mode` from the existing enum) and `dynamic=False`,
+   - use `coordinate_descent_tuning` or similar bounded-runtime-for-unbounded-
+     compile-time tradeoffs.
+
+   Note: when `--compile-warmup` is enabled, one real training batch is pulled
+   from the stream to prime the compiled forward/backward graphs. That batch
+   is dropped, not counted toward `tokens` or any eval. Old records produced
+   under the prior "compile counts" rule have `elapsed_budget_seconds`
+   including compile; new records do not. `eval_loss_drop` is unaffected, but
+   `tokens_per_second` and step counts are not directly comparable across the
+   rule change — tag records pre-/post-2026-05-27 accordingly.
 7. **Beat the prior record.** When baselined on the same hardware, the new run
    must achieve a higher eval loss drop than the previous record.
 
@@ -104,8 +120,9 @@ A PR may not be accepted if it:
 | Input | Value | Revision |
 |-------|-------|----------|
 | Model | `Qwen/Qwen3.5-4B-Base` | `1001bb4d826a52d1f399e183466143f4da7b741b` |
-| Track 1 SFT dataset | `NousResearch/hermes-function-calling-v1` | `dae3e1d28cfbcf4b915c04ea1e072030529b4bda` |
-| Track 1 SFT config | `func_calling_singleturn` | — |
+| Track 1 SFT dataset | `HuggingFaceH4/ultrachat_200k` | `8049631c405ae6576f93f445c6b8166f76f5505a` |
+| Track 1 SFT train split | `train_sft` | — |
+| Track 1 SFT eval split | `test_sft` | — |
 | Legacy CPT dataset | `HuggingFaceTB/finemath` | `e92b25a616738fe95dc186b64dfb19f9c8525594` |
 | Legacy CPT config | `finemath-4plus` | — |
 
@@ -231,8 +248,9 @@ Open a PR with the new record folder. The PR should:
 
 ## Track 1 SFT Validation
 
-Track 1 now defaults to packed Hermes tool-calling SFT plus GraLoRA. Full
-30-minute candidate results from 2026-05-25:
+Track 1 now defaults to packed UltraChat general chat SFT plus GraLoRA. The
+2026-05-25 results below used the previous Hermes SFT default and are retained
+as historical adapter-comparison logs:
 
 | Adapter | Loss drop | Baseline | Final | Steps | Supervised tokens | Log |
 |---|---:|---:|---:|---:|---:|---|
@@ -252,7 +270,7 @@ explicit candidate run from the adapter sweep.
 | mean | `+0.051579` | `0.125171` | `0.073592` | 465 | 750,394 | — |
 
 Conclusion: adopt `--adapter-mode gralora` as the Track 1 default. It produced
-the largest positive eval-loss drop on the shared Hermes SFT eval cache, was
+the largest positive eval-loss drop on the historical Hermes SFT eval cache, was
 materially better than standard LoRA and LoRA-GA in the full-run sweep, and
 repeated with a positive drop across all three 30-minute seeds.
 
@@ -519,7 +537,7 @@ Modal image with:
 - `peft` LoRA/GraLoRA support; default mode applies all-linear rank-32 GraLoRA
   adapters before compile and auto-resolves to `micro_batch_size=8`,
   `grad_accum=1`, and checkpointing on H100
-- Track 1 defaults to Hermes single-turn function-calling SFT, rendered as Qwen ChatML
+- Track 1 defaults to UltraChat general chat SFT, rendered as Qwen ChatML
   with assistant-only labels; `--data-mode cpt` restores packed FineMath all-token labels
 - Adapter selection via `--adapter-mode gralora`, `lora`, or `lora_ga`; LoRA-GA
   reuses masked SFT batches for its gradient estimate, and GraLoRA defaults to

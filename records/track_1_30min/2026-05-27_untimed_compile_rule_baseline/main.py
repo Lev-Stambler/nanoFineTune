@@ -1,7 +1,8 @@
-"""nanoFineTune: a Modal H100 speedrun for fine-tuning.
+"""modded-continued-training: a Modal H100 speedrun for fine-tuning.
 
-Tracks train Qwen3.5-4B-Base on FineMath for a fixed wall-clock budget and
-score the run by the drop in heldout next-token loss.
+Track 1 trains Qwen3.5-4B-Base on UltraChat general SFT data by default and
+scores the run by the drop in heldout assistant-only loss. The legacy FineMath
+continued-pretraining path remains available with ``--data-mode cpt``.
 
 Track 1: 30-minute budget (default)
 Track 2: 5-minute sprint
@@ -14,13 +15,14 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
 import modal
 
 
-APP_NAME = "nanofinetune"
+APP_NAME = "modded-continued-training"
 CACHE_MOUNT = Path("/cache")
 HF_CACHE = CACHE_MOUNT / "huggingface"
 
@@ -29,25 +31,43 @@ DEFAULT_MODEL_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
 DEFAULT_DATASET_ID = "HuggingFaceTB/finemath"
 DEFAULT_DATASET_CONFIG = "finemath-4plus"
 DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
+DEFAULT_SFT_DATASET_ID = "HuggingFaceH4/ultrachat_200k"
+DEFAULT_SFT_DATASET_CONFIG = ""
+DEFAULT_SFT_DATASET_REVISION = "8049631c405ae6576f93f445c6b8166f76f5505a"
+DEFAULT_SFT_TRAIN_SPLIT = "train_sft"
+DEFAULT_SFT_EVAL_SPLIT = "test_sft"
 DEFAULT_EFFECTIVE_TOKENS_PER_STEP = 32_768
 DEFAULT_LORA_MICRO_BATCH_SIZE = 8
 DEFAULT_FULL_MICRO_BATCH_SIZE = 1
 DEFAULT_EVAL_MICRO_BATCH_SIZE = 2
+DEFAULT_GRALORA_K = 2
+DEFAULT_ADAPTER_MODE = "gralora"
 DEFAULT_LORAPLUS_LR_RATIO = 16.0
 DEFAULT_LORA_EVA_RHO = 2.0
+DEFAULT_MUON_QUANT_BLOCK_SIZE = 2048
+DEFAULT_NORMUON_BETA2 = 0.95
+DEFAULT_NORMUON_EPS = 1.0e-8
+DEFAULT_SEQUENCE_PACKING = True
+DEFAULT_PACKING_STRATEGY = "stream_concat_no_padding"
 
+DATA_MODE_CHOICES = {"sft", "cpt"}
+ADAPTER_MODE_CHOICES = {"lora", "lora_ga", "gralora"}
 OPTIMIZER_CHOICES = {
     "auto",
     "adamw8bit",
     "adamw_fused",
     "muon",
+    "muon8",
+    "normuon",
     "loraplus_adamw",
     "loraplus_adamw8bit",
     "lorafa",
 }
-LR_SCHEDULE_CHOICES = {"constant", "wsd"}
+LR_SCHEDULE_CHOICES = {"constant", "linear", "cosine", "wsd"}
 MUON_LR_ADJUSTMENT_CHOICES = {"original", "match_rms_adamw"}
-LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal"}
+LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal", "lora_ga"}
+LORA_GA_DIRECTION_CHOICES = {"ArBr", "A2rBr", "ArB2r", "random"}
+LORA_GA_SCALE_CHOICES = {"stable", "weight_svd", "gd_scale", "unit"}
 
 PEAK_GPU_STAT_KEYS = {
     "cuda_max_memory_allocated_gib": "peak_cuda_memory_allocated_gib",
@@ -67,9 +87,110 @@ TRACKS: dict[str, dict[str, Any]] = {
     "3": {"name": "2hr", "default_minutes": 120.0, "record_dir": "records/track_3_2hr"},
 }
 
+SFT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "prompter": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "tool": "tool",
+}
+
+
+def _iter_sft_turns(row: dict[str, Any]) -> list[tuple[str, Any]] | None:
+    conversations = row.get("conversations")
+    if isinstance(conversations, list):
+        if not all(isinstance(turn, dict) for turn in conversations):
+            return None
+        return [(turn.get("from"), turn.get("value")) for turn in conversations]
+
+    messages = row.get("messages")
+    if isinstance(messages, list):
+        if not all(isinstance(turn, dict) for turn in messages):
+            return None
+        return [(turn.get("role"), turn.get("content")) for turn in messages]
+
+    return None
+
+
+def _render_sft_row(
+    row: dict[str, Any],
+    tokenize_piece,
+    seq_len: int,
+) -> tuple[list[int], list[int]] | None:
+    turns = _iter_sft_turns(row)
+    if not turns:
+        return None
+
+    input_ids: list[int] = []
+    labels: list[int] = []
+    supervised_tokens = 0
+    for source_role, value in turns:
+        if not isinstance(source_role, str):
+            return None
+        role = SFT_ROLE_MAP.get(source_role.lower())
+        if role is None:
+            return None
+
+        if not isinstance(value, str):
+            value = "" if value is None else json.dumps(value, sort_keys=True)
+
+        prefix_ids = tokenize_piece(f"<|im_start|>{role}\n")
+        content_ids = tokenize_piece(value)
+        suffix_ids = tokenize_piece("<|im_end|>\n")
+        input_ids.extend(prefix_ids)
+        input_ids.extend(content_ids)
+        input_ids.extend(suffix_ids)
+
+        if role == "assistant":
+            labels.extend([-100] * len(prefix_ids))
+            labels.extend(content_ids)
+            labels.extend(suffix_ids)
+            supervised_tokens += len(content_ids) + len(suffix_ids)
+        else:
+            labels.extend([-100] * (len(prefix_ids) + len(content_ids) + len(suffix_ids)))
+
+    if not input_ids or supervised_tokens == 0:
+        return None
+    if len(input_ids) != len(labels):
+        raise RuntimeError("SFT renderer produced misaligned input_ids and labels")
+    if len(input_ids) > seq_len:
+        input_ids = input_ids[-seq_len:]
+        labels = labels[-seq_len:]
+        if not any(label != -100 for label in labels):
+            return None
+    return input_ids, labels
+
+
+def _resolve_dataset_defaults(
+    data_mode: str,
+    dataset_id: str,
+    dataset_config: str,
+    dataset_revision: str,
+) -> tuple[str, str, str]:
+    if not dataset_id:
+        if data_mode == "sft":
+            return DEFAULT_SFT_DATASET_ID, DEFAULT_SFT_DATASET_CONFIG, DEFAULT_SFT_DATASET_REVISION
+        return DEFAULT_DATASET_ID, DEFAULT_DATASET_CONFIG, DEFAULT_DATASET_REVISION
+
+    legacy_defaults = (DEFAULT_DATASET_ID, DEFAULT_DATASET_CONFIG, DEFAULT_DATASET_REVISION)
+    if data_mode == "sft" and (dataset_id, dataset_config, dataset_revision) == legacy_defaults:
+        return DEFAULT_SFT_DATASET_ID, DEFAULT_SFT_DATASET_CONFIG, DEFAULT_SFT_DATASET_REVISION
+    return dataset_id, dataset_config, dataset_revision
+
+
+def _supervised_token_count(labels) -> int:
+    if isinstance(labels, list):
+        if labels and isinstance(labels[0], list):
+            return sum(1 for row in labels for label in row[1:] if label != -100)
+        return sum(1 for label in labels[1:] if label != -100)
+    shifted = labels[..., 1:]
+    return int((shifted != -100).sum())
+
 
 app = modal.App(APP_NAME)
-cache_volume = modal.Volume.from_name("nanofinetune-cache", create_if_missing=True)
+cache_volume = modal.Volume.from_name("modded-continued-training-cache", create_if_missing=True)
 wandb_secret_values = {"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")}
 if os.environ.get("WANDB_BASE_URL"):
     wandb_secret_values["WANDB_BASE_URL"] = os.environ["WANDB_BASE_URL"]
@@ -133,12 +254,20 @@ def _format_record_text(summary: dict[str, Any]) -> str:
         f"Description: {summary['record_description']}\n"
         f"Contributors: {summary['record_contributors']}\n"
         f"Date: {summary['record_date']}\n"
+        f"Data mode: {summary.get('data_mode', 'cpt')}\n"
+        f"Loss mask: {summary.get('loss_mask', 'all_tokens')}\n"
+        f"Sequence packing: {summary.get('sequence_packing', DEFAULT_SEQUENCE_PACKING)} "
+        f"({summary.get('packing_strategy', DEFAULT_PACKING_STRATEGY)})\n"
+        f"Adapter mode: {summary.get('adapter_mode', DEFAULT_ADAPTER_MODE)}\n"
         f"Minutes: {summary['minutes']}\n"
         f"Eval loss drop: {summary['eval_loss_drop']:.6f}\n"
         f"Baseline eval loss: {summary['baseline_eval_loss']:.6f}\n"
         f"Final eval loss: {summary['final_eval_loss']:.6f}\n"
         f"Steps: {summary['steps']}\n"
         f"Tokens: {summary['tokens']:,}\n"
+        f"Supervised tokens: {summary.get('supervised_tokens', summary['tokens']):,}\n"
+        f"Eval supervised tokens: {summary.get('eval_supervised_tokens', 0):,}\n"
+        f"Compile + warmup (untimed): {summary.get('elapsed_compile_warmup_seconds', 0.0):.1f}s\n"
         f"Elapsed budget: {summary['elapsed_budget_seconds']:.1f}s\n"
         f"Budget tokens/sec: {summary['tokens_per_second']:.0f}\n"
         f"Train-loop elapsed: {summary['elapsed_train_loop_seconds']:.1f}s\n"
@@ -186,15 +315,19 @@ def run_track1(
     seed: int = 1337,
     model_id: str = DEFAULT_MODEL_ID,
     model_revision: str = DEFAULT_MODEL_REVISION,
-    dataset_id: str = DEFAULT_DATASET_ID,
-    dataset_config: str = DEFAULT_DATASET_CONFIG,
-    dataset_revision: str = DEFAULT_DATASET_REVISION,
+    dataset_id: str = "",
+    dataset_config: str = "",
+    dataset_revision: str = "",
+    data_mode: str = "sft",
     tuning_mode: Literal["lora", "full"] = "lora",
+    adapter_mode: str = "",
     optimizer_name: Literal[
         "auto",
         "adamw8bit",
         "adamw_fused",
         "muon",
+        "muon8",
+        "normuon",
         "loraplus_adamw",
         "loraplus_adamw8bit",
         "lorafa",
@@ -204,15 +337,25 @@ def run_track1(
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
     lora_target_modules: str = "all-linear",
+    gralora_k: int = DEFAULT_GRALORA_K,
     lora_use_rslora: bool = True,
     lora_use_dora: bool = False,
     lora_init: str = "default",
     lora_eva_rho: float = DEFAULT_LORA_EVA_RHO,
     lora_eva_batches: int = 16,
+    lora_ga_batches: int = 4,
+    lora_ga_micro_batch_size: int = 1,
+    lora_ga_direction: str = "ArB2r",
+    lora_ga_scale: str = "stable",
+    lora_ga_stable_gamma: int = 16,
+    lora_ga_cache: bool = False,
     loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
     loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: Literal["original", "match_rms_adamw"] = "match_rms_adamw",
-    lr_schedule: Literal["constant", "wsd"] = "constant",
+    muon_quant_block_size: int = DEFAULT_MUON_QUANT_BLOCK_SIZE,
+    normuon_beta2: float = DEFAULT_NORMUON_BETA2,
+    normuon_eps: float = DEFAULT_NORMUON_EPS,
+    lr_schedule: Literal["constant", "linear", "cosine", "wsd"] = "constant",
     lr_decay_fraction: float = 0.1,
     min_lr_ratio: float = 0.0,
     attn_implementation: Literal["flex_attention", "flash_attention_2", "sdpa", "eager"] = "flex_attention",
@@ -273,8 +416,22 @@ def run_track1(
         raise ValueError("--lr must be non-negative; use 0 for the mode default")
     if weight_decay < 0.0 and weight_decay != -1.0:
         raise ValueError("--weight-decay must be >= 0; use -1 for the mode default")
+    if track not in TRACKS:
+        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
+    data_mode = str(data_mode or ("sft" if track == "1" else "cpt")).lower().replace("-", "_")
+    if data_mode not in DATA_MODE_CHOICES:
+        raise ValueError(f"--data-mode must be one of: {', '.join(sorted(DATA_MODE_CHOICES))}")
+    tuning_mode = str(tuning_mode).lower()
     if tuning_mode not in {"lora", "full"}:
         raise ValueError("--tuning-mode must be one of: lora, full")
+    adapter_mode_default = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
+    adapter_mode = str(adapter_mode or adapter_mode_default).lower().replace("-", "_")
+    if adapter_mode in {"loraga", "lora-ga"}:
+        adapter_mode = "lora_ga"
+    if adapter_mode not in ADAPTER_MODE_CHOICES:
+        raise ValueError(
+            f"--adapter-mode must be one of: {', '.join(sorted(ADAPTER_MODE_CHOICES))}"
+        )
     gradient_checkpointing = str(gradient_checkpointing).lower()
     if gradient_checkpointing not in {"auto", "true", "false"}:
         raise ValueError("--gradient-checkpointing must be one of: auto, true, false")
@@ -289,7 +446,19 @@ def run_track1(
         raise ValueError("--lora-alpha must be positive")
     if lora_dropout < 0.0 or lora_dropout >= 1.0:
         raise ValueError("--lora-dropout must be in [0, 1)")
-    lora_init = str(lora_init).lower()
+    if gralora_k < 1:
+        raise ValueError("--gralora-k must be positive")
+    if adapter_mode == "gralora" and lora_r % gralora_k != 0:
+        raise ValueError("--lora-r must be divisible by --gralora-k for GraLoRA")
+    lora_init = str(lora_init).lower().replace("-", "_")
+    if lora_init == "loraga":
+        lora_init = "lora_ga"
+    if adapter_mode == "lora_ga":
+        if lora_init not in {"default", "lora_ga"}:
+            raise ValueError("--adapter-mode lora_ga cannot be combined with a different --lora-init")
+        lora_init = "lora_ga"
+    elif adapter_mode == "lora" and lora_init == "lora_ga":
+        adapter_mode = "lora_ga"
     if lora_init.startswith("pissa_niter_"):
         try:
             pissa_iters = int(lora_init.removeprefix("pissa_niter_"))
@@ -306,6 +475,25 @@ def run_track1(
         raise ValueError("--lora-eva-rho must be >= 1.0")
     if lora_eva_batches < 1:
         raise ValueError("--lora-eva-batches must be positive")
+    if lora_ga_batches < 1:
+        raise ValueError("--lora-ga-batches must be positive")
+    if lora_ga_micro_batch_size < 1:
+        raise ValueError("--lora-ga-micro-batch-size must be positive")
+    direction_lookup = {value.lower(): value for value in LORA_GA_DIRECTION_CHOICES}
+    lora_ga_direction = direction_lookup.get(str(lora_ga_direction).lower(), lora_ga_direction)
+    if lora_ga_direction not in LORA_GA_DIRECTION_CHOICES:
+        raise ValueError(
+            "--lora-ga-direction must be one of: "
+            f"{', '.join(sorted(LORA_GA_DIRECTION_CHOICES))}"
+        )
+    lora_ga_scale = str(lora_ga_scale).lower()
+    if lora_ga_scale not in LORA_GA_SCALE_CHOICES:
+        raise ValueError(
+            "--lora-ga-scale must be one of: "
+            f"{', '.join(sorted(LORA_GA_SCALE_CHOICES))}"
+        )
+    if lora_ga_stable_gamma < 1:
+        raise ValueError("--lora-ga-stable-gamma must be positive")
     if loraplus_lr_ratio < 1.0:
         raise ValueError("--loraplus-lr-ratio must be >= 1.0")
     if loraplus_lr_embedding <= 0.0:
@@ -315,6 +503,12 @@ def run_track1(
             "--muon-lr-adjustment must be one of: "
             f"{', '.join(sorted(MUON_LR_ADJUSTMENT_CHOICES))}"
         )
+    if muon_quant_block_size < 1:
+        raise ValueError("--muon-quant-block-size must be positive")
+    if normuon_beta2 < 0.0 or normuon_beta2 >= 1.0:
+        raise ValueError("--normuon-beta2 must be in [0, 1)")
+    if normuon_eps <= 0.0:
+        raise ValueError("--normuon-eps must be positive")
     lr_schedule = str(lr_schedule).lower()
     if lr_schedule not in LR_SCHEDULE_CHOICES:
         raise ValueError(f"--lr-schedule must be one of: {', '.join(sorted(LR_SCHEDULE_CHOICES))}")
@@ -328,16 +522,42 @@ def run_track1(
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Modal H100 training path")
-    if track not in TRACKS:
-        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
+    if data_mode == "sft" and track != "1":
+        raise ValueError("--data-mode sft is currently implemented only for Track 1")
     if optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"} and tuning_mode != "lora":
         raise ValueError(f"--optimizer-name {optimizer_name} requires --tuning-mode lora")
-    if lora_init == "eva" and tuning_mode != "lora":
+    if (
+        adapter_mode == "gralora"
+        and optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"}
+    ):
+        raise ValueError(f"--optimizer-name {optimizer_name} requires standard LoRA adapters")
+    if (
+        tuning_mode == "lora"
+        and adapter_mode == "gralora"
+        and optimizer_name in {"muon", "muon8", "normuon"}
+    ):
+        raise ValueError(f"--optimizer-name {optimizer_name} requires standard LoRA or full tuning")
+    if adapter_mode == "gralora" and lora_init != "default":
+        raise ValueError("--adapter-mode gralora does not support --lora-init")
+    if adapter_mode == "gralora" and lora_use_dora:
+        raise ValueError("--adapter-mode gralora does not support --lora-use-dora")
+    if lora_init in {"eva", "lora_ga"} and tuning_mode != "lora":
         raise ValueError(f"--lora-init {lora_init} requires --tuning-mode lora")
+    if adapter_mode != "lora" and tuning_mode != "lora":
+        raise ValueError(f"--adapter-mode {adapter_mode} requires --tuning-mode lora")
     if lora_use_dora and tuning_mode != "lora":
         raise ValueError("--lora-use-dora requires --tuning-mode lora")
 
     track_info = TRACKS[track]
+    requested_dataset_id = dataset_id
+    requested_dataset_config = dataset_config
+    requested_dataset_revision = dataset_revision
+    dataset_id, dataset_config, dataset_revision = _resolve_dataset_defaults(
+        data_mode,
+        dataset_id,
+        dataset_config,
+        dataset_revision,
+    )
     requested_micro_batch_size = micro_batch_size
     requested_grad_accum = grad_accum
     requested_eval_micro_batch_size = eval_micro_batch_size
@@ -355,10 +575,6 @@ def run_track1(
     requested_lr = lr
     requested_weight_decay = weight_decay
     requested_optimizer_name = optimizer_name
-    wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
-    wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
-    lr = lr if lr > 0.0 else (2.0e-4 if tuning_mode == "lora" else 2.0e-5)
-    weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
     resolved_optimizer_name = (
         "adamw_fused"
         if optimizer_name == "auto" and tuning_mode == "lora"
@@ -366,6 +582,16 @@ def run_track1(
         if optimizer_name == "auto"
         else optimizer_name
     )
+    wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
+    wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
+    if lr <= 0.0:
+        if tuning_mode == "lora" and resolved_optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit"}:
+            lr = 5.0e-5
+        elif tuning_mode == "lora":
+            lr = 2.0e-4
+        else:
+            lr = 2.0e-5
+    weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
     checkpointing_enabled = gradient_checkpointing == "true" or (
         gradient_checkpointing == "auto"
         and (tuning_mode == "full" or (tuning_mode == "lora" and micro_batch_size > 1))
@@ -395,12 +621,42 @@ def run_track1(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    run_id = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
+    run_id = f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:8]}"
     run_dir = CACHE_MOUNT / "runs" / run_id
     eval_dir = CACHE_MOUNT / "eval"
     run_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
+    lora_ga_cache_file = None
+    if tuning_mode == "lora" and adapter_mode == "lora_ga" and lora_ga_cache:
+        lora_ga_cache_payload = {
+            "model": model_id,
+            "model_revision": model_revision,
+            "dataset": dataset_id,
+            "dataset_config": dataset_config,
+            "dataset_revision": dataset_revision,
+            "data_mode": data_mode,
+            "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
+            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
+            "packing_strategy": DEFAULT_PACKING_STRATEGY,
+            "seq_len": seq_len,
+            "eval_blocks": eval_blocks,
+            "seed": seed,
+            "adapter_mode": adapter_mode,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_target_modules": lora_target_modules,
+            "lora_use_rslora": lora_use_rslora,
+            "lora_ga_batches": lora_ga_batches,
+            "lora_ga_micro_batch_size": lora_ga_micro_batch_size,
+            "lora_ga_direction": lora_ga_direction,
+            "lora_ga_scale": lora_ga_scale,
+            "lora_ga_stable_gamma": lora_ga_stable_gamma,
+        }
+        lora_ga_cache_key = hashlib.sha256(
+            json.dumps(lora_ga_cache_payload, sort_keys=True).encode()
+        ).hexdigest()[:20]
+        lora_ga_cache_file = str(CACHE_MOUNT / "loraga" / f"{lora_ga_cache_key}.pt")
 
     bytes_per_gib = 1024**3
     gpu_index = torch.cuda.current_device()
@@ -503,7 +759,17 @@ def run_track1(
         "dataset_id": dataset_id,
         "dataset_config": dataset_config,
         "dataset_revision": dataset_revision,
+        "requested_dataset_id": requested_dataset_id,
+        "requested_dataset_config": requested_dataset_config,
+        "requested_dataset_revision": requested_dataset_revision,
+        "data_mode": data_mode,
+        "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
+        "sequence_packing": DEFAULT_SEQUENCE_PACKING,
+        "packing_strategy": DEFAULT_PACKING_STRATEGY,
+        "packed_block_size": seq_len,
+        "padding_tokens_per_block": 0,
         "tuning_mode": tuning_mode,
+        "adapter_mode": adapter_mode if tuning_mode == "lora" else None,
         "optimizer_name": resolved_optimizer_name,
         "requested_optimizer_name": requested_optimizer_name,
         "gradient_checkpointing": gradient_checkpointing,
@@ -513,14 +779,31 @@ def run_track1(
         "lora_alpha": lora_alpha if tuning_mode == "lora" else None,
         "lora_dropout": lora_dropout if tuning_mode == "lora" else None,
         "lora_target_modules": lora_target_modules if tuning_mode == "lora" else None,
-        "lora_use_rslora": lora_use_rslora if tuning_mode == "lora" else None,
-        "lora_use_dora": lora_use_dora if tuning_mode == "lora" else None,
-        "lora_init": lora_init if tuning_mode == "lora" else None,
-        "lora_eva_rho": lora_eva_rho if tuning_mode == "lora" else None,
-        "lora_eva_batches": lora_eva_batches if tuning_mode == "lora" else None,
+        "gralora_k": gralora_k if tuning_mode == "lora" and adapter_mode == "gralora" else None,
+        "lora_use_rslora": lora_use_rslora if tuning_mode == "lora" and adapter_mode != "gralora" else None,
+        "lora_use_dora": lora_use_dora if tuning_mode == "lora" and adapter_mode != "gralora" else None,
+        "lora_init": lora_init if tuning_mode == "lora" and adapter_mode != "gralora" else None,
+        "lora_eva_rho": lora_eva_rho if tuning_mode == "lora" and adapter_mode != "gralora" else None,
+        "lora_eva_batches": lora_eva_batches if tuning_mode == "lora" and adapter_mode != "gralora" else None,
+        "lora_ga_batches": lora_ga_batches if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
+        "lora_ga_micro_batch_size": lora_ga_micro_batch_size
+        if tuning_mode == "lora" and adapter_mode == "lora_ga"
+        else None,
+        "lora_ga_direction": lora_ga_direction if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
+        "lora_ga_scale": lora_ga_scale if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
+        "lora_ga_stable_gamma": lora_ga_stable_gamma
+        if tuning_mode == "lora" and adapter_mode == "lora_ga"
+        else None,
+        "lora_ga_cache": lora_ga_cache if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
+        "lora_ga_cache_file": lora_ga_cache_file
+        if tuning_mode == "lora" and adapter_mode == "lora_ga"
+        else None,
         "loraplus_lr_ratio": loraplus_lr_ratio,
         "loraplus_lr_embedding": loraplus_lr_embedding,
         "muon_lr_adjustment": muon_lr_adjustment,
+        "muon_quant_block_size": muon_quant_block_size,
+        "normuon_beta2": normuon_beta2,
+        "normuon_eps": normuon_eps,
         "lr_schedule": lr_schedule,
         "lr_decay_fraction": lr_decay_fraction,
         "min_lr_ratio": min_lr_ratio,
@@ -598,11 +881,15 @@ def run_track1(
             dir=str(run_dir),
         )
 
-    def dataset_stream(shuffle: bool = False):
+    def dataset_stream(shuffle: bool = False, purpose: Literal["train", "eval"] = "train"):
+        if data_mode == "sft" and dataset_id == DEFAULT_SFT_DATASET_ID:
+            split = DEFAULT_SFT_EVAL_SPLIT if purpose == "eval" else DEFAULT_SFT_TRAIN_SPLIT
+        else:
+            split = "train"
         ds = load_dataset(
             dataset_id,
-            dataset_config,
-            split="train",
+            dataset_config or None,
+            split=split,
             streaming=True,
             revision=dataset_revision or None,
             cache_dir=str(HF_CACHE / "datasets"),
@@ -623,13 +910,33 @@ def run_track1(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    def tokenize_piece(text: str) -> list[int]:
+        return tokenizer(text, add_special_tokens=False).input_ids
+
     def tokenize_text(text: str) -> list[int]:
         ids = tokenizer(text, add_special_tokens=False).input_ids
         if ids:
             ids.append(tokenizer.eos_token_id)
         return ids
 
-    def build_eval_cache() -> tuple[torch.Tensor, int, Path]:
+    def render_sft_row(row: dict[str, Any]) -> tuple[list[int], list[int]] | None:
+        return _render_sft_row(row, tokenize_piece, seq_len)
+
+    def build_eval_cache() -> tuple[torch.Tensor, torch.Tensor, int, Path, int]:
+        if data_mode == "sft":
+            return build_sft_eval_cache()
+        return build_cpt_eval_cache()
+
+    def load_eval_payload(eval_path: Path) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        payload = torch.load(eval_path, map_location="cpu")
+        input_ids = payload["input_ids"]
+        labels = payload.get("labels")
+        if labels is None:
+            labels = input_ids.clone()
+        supervised_tokens = int(payload.get("supervised_tokens", _supervised_token_count(labels)))
+        return input_ids, labels, int(payload["skip_docs"]), supervised_tokens
+
+    def build_cpt_eval_cache() -> tuple[torch.Tensor, torch.Tensor, int, Path, int]:
         key_payload = {
             "model": model_id,
             "model_revision": model_revision,
@@ -638,14 +945,16 @@ def run_track1(
             "dataset_revision": dataset_revision,
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
+            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
+            "packing_strategy": DEFAULT_PACKING_STRATEGY,
             "seed": seed,
             "kind": "all_token_cpt_packed_v2",
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
         if eval_path.exists():
-            payload = torch.load(eval_path, map_location="cpu")
-            return payload["input_ids"], int(payload["skip_docs"]), eval_path
+            input_ids, labels, skip_docs, supervised_tokens = load_eval_payload(eval_path)
+            return input_ids, labels, skip_docs, eval_path, supervised_tokens
 
         need_tokens = eval_blocks * seq_len
         token_buffer: list[int] = []
@@ -666,20 +975,143 @@ def run_track1(
             )
 
         input_ids = torch.tensor(token_buffer[:need_tokens], dtype=torch.long).view(eval_blocks, seq_len)
+        labels = input_ids.clone()
+        supervised_tokens = int(labels.numel())
         torch.save(
-            {"input_ids": input_ids, "skip_docs": skip_docs, "key_payload": key_payload},
+            {
+                "input_ids": input_ids,
+                "labels": labels,
+                "skip_docs": skip_docs,
+                "supervised_tokens": supervised_tokens,
+                "key_payload": key_payload,
+            },
             eval_path,
         )
-        return input_ids, skip_docs, eval_path
+        return input_ids, labels, skip_docs, eval_path, supervised_tokens
 
-    eval_input_ids, train_skip_docs, eval_path = build_eval_cache()
-    print(f"fixed eval cache: {eval_path} skip_docs={train_skip_docs}", flush=True)
+    def build_sft_eval_cache() -> tuple[torch.Tensor, torch.Tensor, int, Path, int]:
+        key_payload = {
+            "model": model_id,
+            "model_revision": model_revision,
+            "dataset": dataset_id,
+            "dataset_config": dataset_config,
+            "dataset_revision": dataset_revision,
+            "seq_len": seq_len,
+            "eval_blocks": eval_blocks,
+            "eval_split": DEFAULT_SFT_EVAL_SPLIT if dataset_id == DEFAULT_SFT_DATASET_ID else "train",
+            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
+            "packing_strategy": DEFAULT_PACKING_STRATEGY,
+            "kind": "chatml_assistant_only_sft_packed_v2",
+        }
+        key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
+        eval_path = eval_dir / f"{key}.pt"
+        if eval_path.exists():
+            input_ids, labels, skip_docs, supervised_tokens = load_eval_payload(eval_path)
+            return input_ids, labels, skip_docs, eval_path, supervised_tokens
+
+        token_buffer: list[int] = []
+        label_buffer: list[int] = []
+        input_blocks: list[torch.Tensor] = []
+        label_blocks: list[torch.Tensor] = []
+        skip_docs = 0
+
+        def drain_blocks() -> None:
+            while len(token_buffer) >= seq_len and len(input_blocks) < eval_blocks:
+                block_ids = token_buffer[:seq_len]
+                block_labels = label_buffer[:seq_len]
+                del token_buffer[:seq_len]
+                del label_buffer[:seq_len]
+                if _supervised_token_count(block_labels) == 0:
+                    continue
+                input_blocks.append(torch.tensor(block_ids, dtype=torch.long))
+                label_blocks.append(torch.tensor(block_labels, dtype=torch.long))
+
+        for row in dataset_stream(shuffle=False, purpose="eval"):
+            skip_docs += 1
+            rendered = render_sft_row(row)
+            if rendered is None:
+                continue
+            row_ids, row_labels = rendered
+            token_buffer.extend(row_ids)
+            label_buffer.extend(row_labels)
+            drain_blocks()
+            if len(input_blocks) >= eval_blocks:
+                break
+
+        if len(input_blocks) < eval_blocks:
+            raise RuntimeError(
+                f"could only build {len(input_blocks)} SFT eval blocks, needed {eval_blocks}"
+            )
+
+        input_ids = torch.stack(input_blocks)
+        labels = torch.stack(label_blocks)
+        supervised_tokens = _supervised_token_count(labels)
+        torch.save(
+            {
+                "input_ids": input_ids,
+                "labels": labels,
+                "skip_docs": 0 if dataset_id == DEFAULT_SFT_DATASET_ID else skip_docs,
+                "eval_docs": skip_docs,
+                "supervised_tokens": supervised_tokens,
+                "key_payload": key_payload,
+            },
+            eval_path,
+        )
+        train_skip = 0 if dataset_id == DEFAULT_SFT_DATASET_ID else skip_docs
+        return input_ids, labels, train_skip, eval_path, supervised_tokens
+
+    eval_input_ids, eval_labels, train_skip_docs, eval_path, eval_supervised_tokens = build_eval_cache()
+    config["eval_supervised_tokens"] = eval_supervised_tokens
+    write_config()
+    print(
+        f"fixed eval cache: {eval_path} skip_docs={train_skip_docs} "
+        f"supervised_tokens={eval_supervised_tokens}",
+        flush=True,
+    )
 
     def parse_lora_target_modules(value: str) -> str | list[str]:
         value = value.strip()
+        if "visual" in value or "lm_head" in value:
+            raise ValueError("--lora-target-modules must not include visual or lm_head modules")
         if value == "all-linear" or "," not in value:
             return value
         return [part.strip() for part in value.split(",") if part.strip()]
+
+    def expand_all_linear_target_modules(
+        current_model: torch.nn.Module,
+        minimum_dimension: int = 1,
+        dimension_divisor: int = 1,
+    ) -> tuple[list[str], int, int]:
+        modules: list[str] = []
+        skipped_small = 0
+        skipped_divisor = 0
+        for name, module in current_model.named_modules():
+            if not name or "lm_head" in name:
+                continue
+            if (
+                name == "visual"
+                or name.startswith("visual.")
+                or ".visual." in name
+                or name.endswith(".visual")
+            ):
+                continue
+            if isinstance(module, torch.nn.Linear):
+                if min(module.weight.shape) < minimum_dimension:
+                    skipped_small += 1
+                    continue
+                if (
+                    dimension_divisor > 1
+                    and (
+                        module.weight.shape[0] % dimension_divisor != 0
+                        or module.weight.shape[1] % dimension_divisor != 0
+                    )
+                ):
+                    skipped_divisor += 1
+                    continue
+                modules.append(name)
+        if not modules:
+            raise RuntimeError("could not expand all-linear adapter targets")
+        return modules, skipped_small, skipped_divisor
 
     def disable_model_cache(current_model: torch.nn.Module) -> None:
         if hasattr(current_model, "config"):
@@ -710,6 +1142,55 @@ def run_track1(
         if hasattr(current_model, "gradient_checkpointing_disable"):
             current_model.gradient_checkpointing_disable()
 
+    def train_batches(batch_size: int | None = None):
+        active_batch_size = micro_batch_size if batch_size is None else batch_size
+        ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
+        token_buffer: list[int] = []
+        label_buffer: list[int] = []
+        batch: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def make_batch() -> dict[str, torch.Tensor]:
+            input_batch = torch.stack([item[0] for item in batch])
+            label_batch = torch.stack([item[1] for item in batch])
+            batch.clear()
+            return {"input_ids": input_batch, "labels": label_batch}
+
+        while True:
+            for row in ds:
+                if data_mode == "sft":
+                    rendered = render_sft_row(row)
+                    if rendered is None:
+                        continue
+                    row_ids, row_labels = rendered
+                    token_buffer.extend(row_ids)
+                    label_buffer.extend(row_labels)
+                else:
+                    text = row.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    row_ids = tokenize_text(text)
+                    token_buffer.extend(row_ids)
+                    label_buffer.extend(row_ids)
+
+                while len(token_buffer) >= seq_len:
+                    block_ids = token_buffer[:seq_len]
+                    block_labels = label_buffer[:seq_len]
+                    del token_buffer[:seq_len]
+                    del label_buffer[:seq_len]
+                    if data_mode == "sft" and _supervised_token_count(block_labels) == 0:
+                        continue
+                    batch.append(
+                        (
+                            torch.tensor(block_ids, dtype=torch.long),
+                            torch.tensor(block_labels, dtype=torch.long),
+                        )
+                    )
+                    if len(batch) == active_batch_size:
+                        yield make_batch()
+            ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
+
+    device = torch.device("cuda")
+
     print("loading model", flush=True)
     model = ModelClass.from_pretrained(
         model_id,
@@ -723,39 +1204,139 @@ def run_track1(
     freeze_visual(model)
 
     if tuning_mode == "lora":
-        from peft import LoraConfig, TaskType, get_peft_model
-        if lora_init == "eva":
-            from peft import EvaConfig
+        if adapter_mode == "gralora":
+            from peft import get_peft_model
 
-        print(
-            "applying LoRA "
-            f"target_modules={lora_target_modules!r} r={lora_r} alpha={lora_alpha} "
-            f"dropout={lora_dropout} use_rslora={lora_use_rslora} "
-            f"use_dora={lora_use_dora} init={lora_init}",
-            flush=True,
-        )
-        lora_init_value: bool | str = True if lora_init == "default" else lora_init
-        lora_config_kwargs: dict[str, Any] = {
-            "task_type": TaskType.CAUSAL_LM,
-            "target_modules": parse_lora_target_modules(lora_target_modules),
-            "exclude_modules": r".*(visual|lm_head).*",
-            "r": lora_r,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": lora_dropout,
-            "bias": "none",
-            "use_rslora": lora_use_rslora,
-            "use_dora": lora_use_dora,
-            "init_lora_weights": lora_init_value,
-            "ensure_weight_tying": True,
-        }
-        if lora_init == "eva":
-            lora_config_kwargs["eva_config"] = EvaConfig(rho=lora_eva_rho)
-        lora_config = LoraConfig(**lora_config_kwargs)
-        model = get_peft_model(model, lora_config, low_cpu_mem_usage=(lora_init == "eva"))
+            try:
+                from peft import GraloraConfig
+            except ImportError:
+                from peft.tuners.gralora import GraloraConfig
+
+            parsed_gralora_target_modules = parse_lora_target_modules(lora_target_modules)
+            if parsed_gralora_target_modules == "all-linear":
+                (
+                    parsed_gralora_target_modules,
+                    skipped_small,
+                    skipped_divisor,
+                ) = expand_all_linear_target_modules(
+                    model,
+                    dimension_divisor=gralora_k,
+                )
+                print(
+                    f"expanded all-linear to {len(parsed_gralora_target_modules)} GraLoRA target modules "
+                    f"(skipped {skipped_small} small, {skipped_divisor} indivisible by k={gralora_k})",
+                    flush=True,
+                )
+            elif isinstance(parsed_gralora_target_modules, str):
+                if not re.fullmatch(r"[A-Za-z0-9_.]+", parsed_gralora_target_modules):
+                    raise ValueError(
+                        "--adapter-mode gralora requires --lora-target-modules all-linear "
+                        "or explicit module names"
+                    )
+                parsed_gralora_target_modules = [parsed_gralora_target_modules]
+
+            print(
+                "applying GraLoRA "
+                f"target_modules={lora_target_modules!r} r={lora_r} alpha={lora_alpha} "
+                f"dropout={lora_dropout} k={gralora_k}",
+                flush=True,
+            )
+            gralora_config = GraloraConfig(
+                target_modules=parsed_gralora_target_modules,
+                r=lora_r,
+                alpha=lora_alpha,
+                gralora_dropout=lora_dropout,
+                gralora_k=gralora_k,
+                bias="none",
+            )
+            model = get_peft_model(model, gralora_config)
+        else:
+            from peft import LoraConfig, TaskType, get_peft_model
+
+            if lora_init == "eva":
+                from peft import EvaConfig
+            if lora_init == "lora_ga":
+                from peft import LoraGAConfig, preprocess_loraga
+
+            print(
+                "applying LoRA "
+                f"target_modules={lora_target_modules!r} r={lora_r} alpha={lora_alpha} "
+                f"dropout={lora_dropout} use_rslora={lora_use_rslora} "
+                f"use_dora={lora_use_dora} init={lora_init}",
+                flush=True,
+            )
+            lora_init_value: bool | str = True if lora_init == "default" else lora_init
+            parsed_lora_target_modules = parse_lora_target_modules(lora_target_modules)
+            if lora_init == "lora_ga" and parsed_lora_target_modules == "all-linear":
+                parsed_lora_target_modules, skipped_small, skipped_divisor = expand_all_linear_target_modules(
+                    model,
+                    minimum_dimension=2 * lora_r,
+                )
+                print(
+                    f"expanded all-linear to {len(parsed_lora_target_modules)} LoRA-GA target modules "
+                    f"(skipped {skipped_small} modules with min dimension < {2 * lora_r}, "
+                    f"{skipped_divisor} indivisible)",
+                    flush=True,
+                )
+            lora_config_kwargs: dict[str, Any] = {
+                "task_type": TaskType.CAUSAL_LM,
+                "target_modules": parsed_lora_target_modules,
+                "exclude_modules": r".*(visual|lm_head).*",
+                "r": lora_r,
+                "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "bias": "none",
+                "use_rslora": lora_use_rslora,
+                "use_dora": lora_use_dora,
+                "init_lora_weights": lora_init_value,
+                "ensure_weight_tying": True,
+            }
+            if lora_init == "eva":
+                lora_config_kwargs["eva_config"] = EvaConfig(rho=lora_eva_rho)
+            if lora_init == "lora_ga":
+                lora_config_kwargs["lora_ga_config"] = LoraGAConfig(
+                    direction=lora_ga_direction,
+                    scale=lora_ga_scale,
+                    stable_gamma=lora_ga_stable_gamma,
+                )
+            lora_config = LoraConfig(**lora_config_kwargs)
+            if lora_init == "lora_ga":
+                model.to(device)
+                set_gradient_checkpointing(model, checkpointing_enabled)
+                log_gpu("before_loraga_preprocess")
+                loraga_batch_iter = train_batches(batch_size=lora_ga_micro_batch_size)
+
+                def loraga_train_step() -> None:
+                    model.zero_grad(set_to_none=True)
+                    for _ in range(lora_ga_batches):
+                        batch = next(loraga_batch_iter)
+                        input_ids = batch["input_ids"].to(device, non_blocking=True)
+                        labels = batch["labels"].to(device, non_blocking=True)
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            output = model(
+                                input_ids=input_ids,
+                                attention_mask=torch.ones_like(input_ids, dtype=torch.long),
+                                labels=labels,
+                                use_cache=False,
+                            )
+                            loss = output.loss / lora_ga_batches
+                        loss.backward()
+
+                print(
+                    "preprocessing LoRA-GA "
+                    f"batches={lora_ga_batches} micro_batch_size={lora_ga_micro_batch_size} "
+                    f"direction={lora_ga_direction} scale={lora_ga_scale} "
+                    f"cache={'on' if lora_ga_cache_file else 'off'}",
+                    flush=True,
+                )
+                preprocess_loraga(model, lora_config, loraga_train_step, cache_file=lora_ga_cache_file)
+                model.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                log_gpu("after_loraga_preprocess")
+            model = get_peft_model(model, lora_config, low_cpu_mem_usage=(lora_init == "eva"))
 
     set_gradient_checkpointing(model, checkpointing_enabled)
 
-    device = torch.device("cuda")
     model.to(device)
     if tuning_mode == "lora" and lora_init == "eva":
         from peft import initialize_lora_eva_weights
@@ -798,9 +1379,14 @@ def run_track1(
     if trainable_visual_params:
         raise RuntimeError(f"visual parameters must remain frozen: {trainable_visual_params[:5]}")
     if tuning_mode == "lora":
-        non_lora_trainable = [n for n, p in named_trainable_params if "lora_" not in n]
-        if non_lora_trainable:
-            raise RuntimeError(f"LoRA mode found non-adapter trainable parameters: {non_lora_trainable[:5]}")
+        adapter_param_markers = ("gralora_",) if adapter_mode == "gralora" else ("lora_",)
+        non_adapter_trainable = [
+            n for n, p in named_trainable_params if not any(marker in n for marker in adapter_param_markers)
+        ]
+        if non_adapter_trainable:
+            raise RuntimeError(
+                f"{adapter_mode} mode found non-adapter trainable parameters: {non_adapter_trainable[:5]}"
+            )
     trainable_count = sum(p.numel() for p in trainable_params)
     total_count = sum(p.numel() for p in model.parameters())
     print(f"trainable parameters: {trainable_count:,} / {total_count:,}", flush=True)
@@ -885,6 +1471,168 @@ def run_track1(
                     p.add_(update, alpha=-adjusted_lr)
             return loss
 
+    class QuantizedMuon(Muon):
+        @staticmethod
+        def quantize_blockwise(tensor: torch.Tensor, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+            flat = tensor.detach().to(torch.float32).reshape(-1)
+            numel = flat.numel()
+            num_blocks = (numel + block_size - 1) // block_size
+            padded = torch.zeros(num_blocks * block_size, device=flat.device, dtype=torch.float32)
+            padded[:numel] = flat
+            blocks = padded.view(num_blocks, block_size)
+            scales = blocks.abs().amax(dim=1).clamp_min(1.0e-12) / 127.0
+            quantized = torch.round(blocks / scales[:, None]).clamp_(-127, 127).to(torch.int8)
+            return quantized.reshape(-1)[:numel].contiguous().view(tensor.shape), scales
+
+        @staticmethod
+        def dequantize_blockwise(
+            quantized: torch.Tensor,
+            scales: torch.Tensor,
+            block_size: int,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            flat_q = quantized.reshape(-1).to(torch.float32)
+            scale_per_element = scales.repeat_interleave(block_size)[: flat_q.numel()]
+            return (flat_q * scale_per_element).view(quantized.shape).to(dtype)
+
+        def __init__(
+            self,
+            params,
+            lr: float,
+            momentum: float = 0.95,
+            weight_decay: float = 0.0,
+            ns_steps: int = 5,
+            nesterov: bool = True,
+            lr_adjustment: str = "original",
+            block_size: int = DEFAULT_MUON_QUANT_BLOCK_SIZE,
+        ):
+            super().__init__(
+                params,
+                lr=lr,
+                momentum=momentum,
+                weight_decay=weight_decay,
+                ns_steps=ns_steps,
+                nesterov=nesterov,
+                lr_adjustment=lr_adjustment,
+            )
+            for group in self.param_groups:
+                group["block_size"] = block_size
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for group in self.param_groups:
+                lr = group["lr"]
+                momentum = group["momentum"]
+                weight_decay = group["weight_decay"]
+                ns_steps = group["ns_steps"]
+                nesterov = group["nesterov"]
+                lr_adjustment = group["lr_adjustment"]
+                block_size = group["block_size"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.ndim != 2:
+                        raise RuntimeError("Muon only supports 2D matrix parameters")
+                    state = self.state[p]
+                    if "momentum_q" in state:
+                        buf = self.dequantize_blockwise(
+                            state["momentum_q"],
+                            state["momentum_scale"],
+                            block_size,
+                            grad.dtype,
+                        )
+                    else:
+                        buf = torch.zeros_like(grad)
+                    buf.lerp_(grad, 1.0 - momentum)
+                    update = grad.lerp(buf, momentum) if nesterov else buf
+                    update = self.zeropower_via_newtonschulz5(update, ns_steps)
+                    if weight_decay:
+                        p.mul_(1.0 - lr * weight_decay)
+                    adjusted_lr = self.adjust_lr(lr, lr_adjustment, p.shape)
+                    p.add_(update, alpha=-adjusted_lr)
+                    state["momentum_q"], state["momentum_scale"] = self.quantize_blockwise(
+                        buf,
+                        block_size,
+                    )
+                    state.pop("momentum_buffer", None)
+            return loss
+
+    class NorMuon(torch.optim.Optimizer):
+        def __init__(
+            self,
+            params,
+            lr: float,
+            beta1: float = 0.95,
+            beta2: float = DEFAULT_NORMUON_BETA2,
+            eps: float = DEFAULT_NORMUON_EPS,
+            weight_decay: float = 0.0,
+            ns_steps: int = 5,
+        ):
+            super().__init__(
+                params,
+                dict(
+                    lr=lr,
+                    beta1=beta1,
+                    beta2=beta2,
+                    eps=eps,
+                    weight_decay=weight_decay,
+                    ns_steps=ns_steps,
+                ),
+            )
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1 = group["beta1"]
+                beta2 = group["beta2"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+                ns_steps = group["ns_steps"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.ndim != 2:
+                        raise RuntimeError("NorMuon only supports 2D matrix parameters")
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(grad)
+                    buf = state["momentum_buffer"]
+                    buf.lerp_(grad, 1.0 - beta1)
+                    update = Muon.zeropower_via_newtonschulz5(buf, ns_steps)
+                    row_stat = update.to(torch.float32).square().mean(dim=1)
+                    if "row_second_moment" not in state:
+                        state["row_second_moment"] = torch.zeros(
+                            update.shape[0],
+                            device=update.device,
+                            dtype=torch.float32,
+                        )
+                    second = state["row_second_moment"]
+                    second.lerp_(row_stat, 1.0 - beta2)
+                    denom = torch.sqrt(second + eps).to(update.dtype).unsqueeze(1)
+                    normalized_update = update / denom
+                    update_scale = (
+                        0.2
+                        * lr
+                        * math.sqrt(p.numel())
+                        / normalized_update.norm().clamp_min(1.0e-12)
+                    )
+                    normalized_update.mul_(update_scale)
+                    if weight_decay:
+                        p.mul_(1.0 - lr * weight_decay)
+                    p.add_(normalized_update, alpha=-1.0)
+            return loss
+
     def make_optimizer():
         peft_optimizer_model = getattr(model, "_orig_mod", model)
         if resolved_optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit"}:
@@ -953,28 +1701,51 @@ def run_track1(
                 eps=1.0e-8,
                 weight_decay=weight_decay,
             )
-        if resolved_optimizer_name == "muon":
-            muon_params: list[torch.nn.Parameter] = []
+        if resolved_optimizer_name in {"muon", "muon8", "normuon"}:
+            matrix_params: list[torch.nn.Parameter] = []
             adamw_params: list[torch.nn.Parameter] = []
             for name, parameter in named_trainable_params:
                 clean_name = name.removeprefix("_orig_mod.")
                 is_embed_or_head = any(part in clean_name for part in ("embed", "lm_head"))
                 if parameter.ndim == 2 and not is_embed_or_head:
-                    muon_params.append(parameter)
+                    matrix_params.append(parameter)
                 else:
                     adamw_params.append(parameter)
 
             optimizers: list[torch.optim.Optimizer] = []
-            if muon_params:
-                optimizers.append(
-                    Muon(
-                        muon_params,
-                        lr=lr,
-                        momentum=0.95,
-                        weight_decay=weight_decay,
-                        lr_adjustment=muon_lr_adjustment,
+            if matrix_params:
+                if resolved_optimizer_name == "muon8":
+                    optimizers.append(
+                        QuantizedMuon(
+                            matrix_params,
+                            lr=lr,
+                            momentum=0.95,
+                            weight_decay=weight_decay,
+                            lr_adjustment=muon_lr_adjustment,
+                            block_size=muon_quant_block_size,
+                        )
                     )
-                )
+                elif resolved_optimizer_name == "normuon":
+                    optimizers.append(
+                        NorMuon(
+                            matrix_params,
+                            lr=lr,
+                            beta1=0.95,
+                            beta2=normuon_beta2,
+                            eps=normuon_eps,
+                            weight_decay=weight_decay,
+                        )
+                    )
+                else:
+                    optimizers.append(
+                        Muon(
+                            matrix_params,
+                            lr=lr,
+                            momentum=0.95,
+                            weight_decay=weight_decay,
+                            lr_adjustment=muon_lr_adjustment,
+                        )
+                    )
             adamw_name = "none"
             if adamw_params:
                 try:
@@ -989,7 +1760,10 @@ def run_track1(
                     )
                     adamw_name = "adamw8bit"
                 except Exception as exc:
-                    print(f"warning: bitsandbytes AdamW8bit unavailable for Muon tail: {exc}", flush=True)
+                    print(
+                        f"warning: bitsandbytes AdamW8bit unavailable for {resolved_optimizer_name} tail: {exc}",
+                        flush=True,
+                    )
                     adamw = torch.optim.AdamW(
                         adamw_params,
                         lr=lr,
@@ -999,10 +1773,15 @@ def run_track1(
                     )
                     adamw_name = "adamw"
                 optimizers.append(adamw)
+            if resolved_optimizer_name == "normuon":
+                details = f"beta1=0.95 beta2={normuon_beta2} eps={normuon_eps}"
+            else:
+                details = f"lr_adjustment={muon_lr_adjustment}"
+            if resolved_optimizer_name == "muon8":
+                details += f" quant=linear8 block_size={muon_quant_block_size}"
             print(
-                f"optimizer muon: {len(muon_params)} matrix tensors, "
-                f"{adamw_name}: {len(adamw_params)} non-muon tensors, "
-                f"lr_adjustment={muon_lr_adjustment}",
+                f"optimizer {resolved_optimizer_name}: {len(matrix_params)} matrix tensors, "
+                f"{adamw_name}: {len(adamw_params)} non-matrix tensors, {details}",
                 flush=True,
             )
             return optimizers
@@ -1057,37 +1836,29 @@ def run_track1(
     @torch.no_grad()
     def evaluate(label: str) -> float:
         model.eval()
-        losses: list[float] = []
+        weighted_loss_sum = 0.0
+        total_supervised = 0
         for start in range(0, eval_blocks, eval_micro_batch_size):
             batch = eval_input_ids[start : start + eval_micro_batch_size].to(device, non_blocking=True)
+            labels = eval_labels[start : start + eval_micro_batch_size].to(device, non_blocking=True)
+            supervised = _supervised_token_count(labels.detach().cpu())
+            if supervised == 0:
+                continue
             attention_mask = torch.ones_like(batch, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-            losses.append(float(output.loss.detach().cpu()))
-        loss = float(np.mean(losses))
-        log_metric({"event": label, "eval_loss": loss}, include_gpu=True)
+                output = model(input_ids=batch, attention_mask=attention_mask, labels=labels, use_cache=False)
+            weighted_loss_sum += float(output.loss.detach().cpu()) * supervised
+            total_supervised += supervised
+        if total_supervised == 0:
+            raise RuntimeError("evaluation batch had no supervised tokens")
+        loss = weighted_loss_sum / total_supervised
+        log_metric(
+            {"event": label, "eval_loss": loss, "eval_supervised_tokens": total_supervised},
+            include_gpu=True,
+        )
         model.train()
         set_visual_eval(model)
         return loss
-
-    def train_batches():
-        ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
-        token_buffer: list[int] = []
-        batch: list[torch.Tensor] = []
-        while True:
-            for row in ds:
-                text = row.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    continue
-                token_buffer.extend(tokenize_text(text))
-                while len(token_buffer) >= seq_len:
-                    block = torch.tensor(token_buffer[:seq_len], dtype=torch.long)
-                    del token_buffer[:seq_len]
-                    batch.append(block)
-                    if len(batch) == micro_batch_size:
-                        yield torch.stack(batch)
-                        batch.clear()
-            ds = dataset_stream(shuffle=True).skip(train_skip_docs)
 
     batch_iter = train_batches()
 
@@ -1105,25 +1876,32 @@ def run_track1(
         print("running train/compile warmup", flush=True)
         model.train()
         optimizer_zero_grad()
+        warmup_losses: list[torch.Tensor] = []
+        warmup_supervised_counts: list[int] = []
         for _ in range(grad_accum):
-            warmup_batch = next(batch_iter).to(device, non_blocking=True)
+            warmup_batch = next(batch_iter)
+            input_ids = warmup_batch["input_ids"].to(device, non_blocking=True)
+            labels = warmup_batch["labels"].to(device, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 warmup_loss = model(
-                    input_ids=warmup_batch,
-                    attention_mask=torch.ones_like(warmup_batch, dtype=torch.long),
-                    labels=warmup_batch,
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids, dtype=torch.long),
+                    labels=labels,
                     use_cache=False,
-                ).loss / grad_accum
-            warmup_loss.backward()
+                ).loss
+            warmup_losses.append(warmup_loss)
+            warmup_supervised_counts.append(_supervised_token_count(labels.detach().cpu()))
+        warmup_supervised_total = sum(warmup_supervised_counts)
+        if warmup_supervised_total <= 0:
+            raise RuntimeError("warmup batch had no supervised tokens")
+        for warmup_loss, supervised in zip(warmup_losses, warmup_supervised_counts):
+            (warmup_loss * (supervised / warmup_supervised_total)).backward()
         optimizer_zero_grad()
         torch.cuda.synchronize()
 
     baseline_loss = evaluate("baseline_eval")
-    budget_start = time.monotonic()
-    train_deadline = budget_start + minutes * 60.0
-    torch.cuda.reset_peak_memory_stats(gpu_index)
-    peak_gpu_stats.clear()
-    log_gpu("budget_start")
+    compile_warmup_start = time.monotonic()
+    log_gpu("compile_warmup_start")
 
     if compile_model:
         print(f"compiling model with torch.compile(mode={compile_mode!r})", flush=True)
@@ -1168,13 +1946,30 @@ def run_track1(
             write_config()
             run_train_warmup()
 
-    log_gpu("before_train_loop")
     optimizer_zero_grad()
-    train_loop_start = time.monotonic()
+    torch.cuda.reset_peak_memory_stats(gpu_index)
+    peak_gpu_stats.clear()
+    log_gpu("budget_start")
+    log_gpu("before_train_loop")
+    budget_start = time.monotonic()
+    train_deadline = budget_start + minutes * 60.0
+    train_loop_start = budget_start
+
+    full_decay_start_time: float | None = None
 
     def compute_lr_multiplier(step_value: int, now: float) -> float:
+        nonlocal full_decay_start_time
         if warmup_steps > 0 and step_value <= warmup_steps:
             return step_value / warmup_steps
+        if lr_schedule in {"linear", "cosine"}:
+            if full_decay_start_time is None:
+                full_decay_start_time = now
+            decay_seconds = max(train_deadline - full_decay_start_time, 1.0e-9)
+            decay_progress = min(1.0, max(0.0, (now - full_decay_start_time) / decay_seconds))
+            if lr_schedule == "linear":
+                return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - decay_progress)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
         if lr_schedule == "wsd":
             decay_window_seconds = minutes * 60.0 * lr_decay_fraction
             if decay_window_seconds > 0.0:
@@ -1187,19 +1982,32 @@ def run_track1(
 
     step = 0
     tokens = 0
+    supervised_tokens_seen = 0
     last_loss = math.nan
     while time.monotonic() < train_deadline:
         optimizer_zero_grad()
         accum_losses: list[float] = []
+        accum_supervised_tokens = 0
+        accum_loss_tensors: list[tuple[torch.Tensor, int]] = []
         for _ in range(grad_accum):
-            batch = next(batch_iter).to(device, non_blocking=True)
-            attention_mask = torch.ones_like(batch, dtype=torch.long)
+            batch = next(batch_iter)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-                loss = output.loss / grad_accum
-            loss.backward()
+                output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
             accum_losses.append(float(output.loss.detach().cpu()))
-            tokens += int(batch.numel())
+            tokens += int(input_ids.numel())
+            batch_supervised = _supervised_token_count(labels.detach().cpu())
+            if batch_supervised <= 0:
+                raise RuntimeError("training batch had no supervised tokens")
+            accum_supervised_tokens += batch_supervised
+            supervised_tokens_seen += batch_supervised
+            accum_loss_tensors.append((output.loss, batch_supervised))
+
+        for loss_tensor, batch_supervised in accum_loss_tensors:
+            loss = loss_tensor * (batch_supervised / accum_supervised_tokens)
+            loss.backward()
 
         step += 1
         lr_now = time.monotonic()
@@ -1222,10 +2030,17 @@ def run_track1(
                     "lr": step_lr,
                     "lr_multiplier": lr_multiplier,
                     "tokens": tokens,
+                    "supervised_tokens": supervised_tokens_seen,
+                    "step_supervised_tokens": accum_supervised_tokens,
+                    "elapsed_compile_warmup_seconds": budget_start - compile_warmup_start,
                     "elapsed_budget_seconds": elapsed_budget_seconds,
                     "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
                     "tokens_per_second": tokens / max(elapsed_budget_seconds, 1.0e-9),
+                    "supervised_tokens_per_second": supervised_tokens_seen
+                    / max(elapsed_budget_seconds, 1.0e-9),
                     "train_loop_tokens_per_second": tokens / max(elapsed_train_loop_seconds, 1.0e-9),
+                    "train_loop_supervised_tokens_per_second": supervised_tokens_seen
+                    / max(elapsed_train_loop_seconds, 1.0e-9),
                 },
                 include_gpu=True,
             )
@@ -1233,6 +2048,7 @@ def run_track1(
     budget_end = time.monotonic()
     elapsed_budget_seconds = budget_end - budget_start
     elapsed_train_loop_seconds = budget_end - train_loop_start
+    elapsed_compile_warmup_seconds = budget_start - compile_warmup_start
     # Keep post-budget evaluation from triggering a new compiled eval graph.
     model = uncompiled_model
     final_loss = evaluate("final_eval")
@@ -1243,15 +2059,21 @@ def run_track1(
         "run_dir": str(run_dir),
         "eval_cache": str(eval_path),
         "train_skip_docs": train_skip_docs,
+        "eval_supervised_tokens": eval_supervised_tokens,
         "trainable_params": trainable_count,
         "total_params": total_count,
         "steps": step,
         "tokens": tokens,
+        "supervised_tokens": supervised_tokens_seen,
+        "elapsed_compile_warmup_seconds": elapsed_compile_warmup_seconds,
         "elapsed_budget_seconds": elapsed_budget_seconds,
         "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
         "elapsed_train_seconds": elapsed_budget_seconds,
         "tokens_per_second": tokens / max(elapsed_budget_seconds, 1.0e-9),
+        "supervised_tokens_per_second": supervised_tokens_seen / max(elapsed_budget_seconds, 1.0e-9),
         "train_loop_tokens_per_second": tokens / max(elapsed_train_loop_seconds, 1.0e-9),
+        "train_loop_supervised_tokens_per_second": supervised_tokens_seen
+        / max(elapsed_train_loop_seconds, 1.0e-9),
         "last_train_loss": last_loss,
         "baseline_eval_loss": baseline_loss,
         "final_eval_loss": final_loss,
@@ -1305,24 +2127,36 @@ def main(
     seed: int = 1337,
     model_id: str = DEFAULT_MODEL_ID,
     model_revision: str = DEFAULT_MODEL_REVISION,
-    dataset_id: str = DEFAULT_DATASET_ID,
-    dataset_config: str = DEFAULT_DATASET_CONFIG,
-    dataset_revision: str = DEFAULT_DATASET_REVISION,
+    dataset_id: str = "",
+    dataset_config: str = "",
+    dataset_revision: str = "",
+    data_mode: str = "",
     tuning_mode: str = "lora",
+    adapter_mode: str = "",
     optimizer_name: str = "auto",
     gradient_checkpointing: str = "auto",
     lora_r: int = 32,
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
     lora_target_modules: str = "all-linear",
+    gralora_k: int = DEFAULT_GRALORA_K,
     lora_use_rslora: bool = True,
     lora_use_dora: bool = False,
     lora_init: str = "default",
     lora_eva_rho: float = DEFAULT_LORA_EVA_RHO,
     lora_eva_batches: int = 16,
+    lora_ga_batches: int = 4,
+    lora_ga_micro_batch_size: int = 1,
+    lora_ga_direction: str = "ArB2r",
+    lora_ga_scale: str = "stable",
+    lora_ga_stable_gamma: int = 16,
+    lora_ga_cache: bool = False,
     loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
     loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: str = "match_rms_adamw",
+    muon_quant_block_size: int = DEFAULT_MUON_QUANT_BLOCK_SIZE,
+    normuon_beta2: float = DEFAULT_NORMUON_BETA2,
+    normuon_eps: float = DEFAULT_NORMUON_EPS,
     lr_schedule: str = "constant",
     lr_decay_fraction: float = 0.1,
     min_lr_ratio: float = 0.0,
@@ -1342,16 +2176,22 @@ def main(
     record_description: str = "",
     record_contributors: str = "",
 ) -> None:
-    """Run a nanoFineTune track on Modal.
+    """Run a modded-continued-training track on Modal.
 
     --track selects the competition track (1=30min, 2=5min, 3=2hr).
+    Track 1 defaults to packed SFT/GraLoRA; Tracks 2/3 default to legacy CPT/LoRA.
     When --minutes is 0 (default), the track's default budget is used.
     Set --record-description to save a competition record on success.
     """
 
+    if track not in TRACKS:
+        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
+    if not data_mode:
+        data_mode = "sft" if track == "1" else "cpt"
+    if not adapter_mode:
+        adapter_mode = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
+
     if minutes == 0.0:
-        if track not in TRACKS:
-            raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
         minutes = TRACKS[track]["default_minutes"]
 
     summary = run_track1.remote(
@@ -1370,21 +2210,33 @@ def main(
         dataset_id=dataset_id,
         dataset_config=dataset_config,
         dataset_revision=dataset_revision,
+        data_mode=data_mode,  # type: ignore[arg-type]
         tuning_mode=tuning_mode,  # type: ignore[arg-type]
+        adapter_mode=adapter_mode,  # type: ignore[arg-type]
         optimizer_name=optimizer_name,
         gradient_checkpointing=gradient_checkpointing,  # type: ignore[arg-type]
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         lora_target_modules=lora_target_modules,
+        gralora_k=gralora_k,
         lora_use_rslora=lora_use_rslora,
         lora_use_dora=lora_use_dora,
         lora_init=lora_init,
         lora_eva_rho=lora_eva_rho,
         lora_eva_batches=lora_eva_batches,
+        lora_ga_batches=lora_ga_batches,
+        lora_ga_micro_batch_size=lora_ga_micro_batch_size,
+        lora_ga_direction=lora_ga_direction,
+        lora_ga_scale=lora_ga_scale,
+        lora_ga_stable_gamma=lora_ga_stable_gamma,
+        lora_ga_cache=lora_ga_cache,
         loraplus_lr_ratio=loraplus_lr_ratio,
         loraplus_lr_embedding=loraplus_lr_embedding,
         muon_lr_adjustment=muon_lr_adjustment,  # type: ignore[arg-type]
+        muon_quant_block_size=muon_quant_block_size,
+        normuon_beta2=normuon_beta2,
+        normuon_eps=normuon_eps,
         lr_schedule=lr_schedule,  # type: ignore[arg-type]
         lr_decay_fraction=lr_decay_fraction,
         min_lr_ratio=min_lr_ratio,

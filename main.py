@@ -1,6 +1,6 @@
 """modded-continued-training: a Modal H100 speedrun for fine-tuning.
 
-Track 1 trains Qwen3.5-4B-Base on Hermes tool-calling SFT data by default and
+Track 1 trains Qwen3.5-4B-Base on UltraChat general SFT data by default and
 scores the run by the drop in heldout assistant-only loss. The legacy FineMath
 continued-pretraining path remains available with ``--data-mode cpt``.
 
@@ -31,9 +31,11 @@ DEFAULT_MODEL_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
 DEFAULT_DATASET_ID = "HuggingFaceTB/finemath"
 DEFAULT_DATASET_CONFIG = "finemath-4plus"
 DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
-DEFAULT_SFT_DATASET_ID = "NousResearch/hermes-function-calling-v1"
-DEFAULT_SFT_DATASET_CONFIG = "func_calling_singleturn"
-DEFAULT_SFT_DATASET_REVISION = "dae3e1d28cfbcf4b915c04ea1e072030529b4bda"
+DEFAULT_SFT_DATASET_ID = "HuggingFaceH4/ultrachat_200k"
+DEFAULT_SFT_DATASET_CONFIG = ""
+DEFAULT_SFT_DATASET_REVISION = "8049631c405ae6576f93f445c6b8166f76f5505a"
+DEFAULT_SFT_TRAIN_SPLIT = "train_sft"
+DEFAULT_SFT_EVAL_SPLIT = "test_sft"
 DEFAULT_EFFECTIVE_TOKENS_PER_STEP = 32_768
 DEFAULT_LORA_MICRO_BATCH_SIZE = 8
 DEFAULT_FULL_MICRO_BATCH_SIZE = 1
@@ -88,6 +90,7 @@ TRACKS: dict[str, dict[str, Any]] = {
 SFT_ROLE_MAP = {
     "system": "system",
     "human": "user",
+    "prompter": "user",
     "user": "user",
     "gpt": "assistant",
     "assistant": "assistant",
@@ -95,29 +98,41 @@ SFT_ROLE_MAP = {
 }
 
 
+def _iter_sft_turns(row: dict[str, Any]) -> list[tuple[str, Any]] | None:
+    conversations = row.get("conversations")
+    if isinstance(conversations, list):
+        if not all(isinstance(turn, dict) for turn in conversations):
+            return None
+        return [(turn.get("from"), turn.get("value")) for turn in conversations]
+
+    messages = row.get("messages")
+    if isinstance(messages, list):
+        if not all(isinstance(turn, dict) for turn in messages):
+            return None
+        return [(turn.get("role"), turn.get("content")) for turn in messages]
+
+    return None
+
+
 def _render_sft_row(
     row: dict[str, Any],
     tokenize_piece,
     seq_len: int,
 ) -> tuple[list[int], list[int]] | None:
-    conversations = row.get("conversations")
-    if not isinstance(conversations, list):
+    turns = _iter_sft_turns(row)
+    if not turns:
         return None
 
     input_ids: list[int] = []
     labels: list[int] = []
     supervised_tokens = 0
-    for turn in conversations:
-        if not isinstance(turn, dict):
-            return None
-        source_role = turn.get("from")
+    for source_role, value in turns:
         if not isinstance(source_role, str):
             return None
         role = SFT_ROLE_MAP.get(source_role.lower())
         if role is None:
             return None
 
-        value = turn.get("value")
         if not isinstance(value, str):
             value = "" if value is None else json.dumps(value, sort_keys=True)
 
@@ -252,6 +267,7 @@ def _format_record_text(summary: dict[str, Any]) -> str:
         f"Tokens: {summary['tokens']:,}\n"
         f"Supervised tokens: {summary.get('supervised_tokens', summary['tokens']):,}\n"
         f"Eval supervised tokens: {summary.get('eval_supervised_tokens', 0):,}\n"
+        f"Compile + warmup (untimed): {summary.get('elapsed_compile_warmup_seconds', 0.0):.1f}s\n"
         f"Elapsed budget: {summary['elapsed_budget_seconds']:.1f}s\n"
         f"Budget tokens/sec: {summary['tokens_per_second']:.0f}\n"
         f"Train-loop elapsed: {summary['elapsed_train_loop_seconds']:.1f}s\n"
@@ -865,11 +881,15 @@ def run_track1(
             dir=str(run_dir),
         )
 
-    def dataset_stream(shuffle: bool = False):
+    def dataset_stream(shuffle: bool = False, purpose: Literal["train", "eval"] = "train"):
+        if data_mode == "sft" and dataset_id == DEFAULT_SFT_DATASET_ID:
+            split = DEFAULT_SFT_EVAL_SPLIT if purpose == "eval" else DEFAULT_SFT_TRAIN_SPLIT
+        else:
+            split = "train"
         ds = load_dataset(
             dataset_id,
             dataset_config or None,
-            split="train",
+            split=split,
             streaming=True,
             revision=dataset_revision or None,
             cache_dir=str(HF_CACHE / "datasets"),
@@ -978,9 +998,10 @@ def run_track1(
             "dataset_revision": dataset_revision,
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
+            "eval_split": DEFAULT_SFT_EVAL_SPLIT if dataset_id == DEFAULT_SFT_DATASET_ID else "train",
             "sequence_packing": DEFAULT_SEQUENCE_PACKING,
             "packing_strategy": DEFAULT_PACKING_STRATEGY,
-            "kind": "chatml_assistant_only_sft_packed_v1",
+            "kind": "chatml_assistant_only_sft_packed_v2",
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
@@ -1005,7 +1026,7 @@ def run_track1(
                 input_blocks.append(torch.tensor(block_ids, dtype=torch.long))
                 label_blocks.append(torch.tensor(block_labels, dtype=torch.long))
 
-        for row in dataset_stream(shuffle=False):
+        for row in dataset_stream(shuffle=False, purpose="eval"):
             skip_docs += 1
             rendered = render_sft_row(row)
             if rendered is None:
@@ -1029,13 +1050,15 @@ def run_track1(
             {
                 "input_ids": input_ids,
                 "labels": labels,
-                "skip_docs": skip_docs,
+                "skip_docs": 0 if dataset_id == DEFAULT_SFT_DATASET_ID else skip_docs,
+                "eval_docs": skip_docs,
                 "supervised_tokens": supervised_tokens,
                 "key_payload": key_payload,
             },
             eval_path,
         )
-        return input_ids, labels, skip_docs, eval_path, supervised_tokens
+        train_skip = 0 if dataset_id == DEFAULT_SFT_DATASET_ID else skip_docs
+        return input_ids, labels, train_skip, eval_path, supervised_tokens
 
     eval_input_ids, eval_labels, train_skip_docs, eval_path, eval_supervised_tokens = build_eval_cache()
     config["eval_supervised_tokens"] = eval_supervised_tokens
@@ -1877,11 +1900,8 @@ def run_track1(
         torch.cuda.synchronize()
 
     baseline_loss = evaluate("baseline_eval")
-    budget_start = time.monotonic()
-    train_deadline = budget_start + minutes * 60.0
-    torch.cuda.reset_peak_memory_stats(gpu_index)
-    peak_gpu_stats.clear()
-    log_gpu("budget_start")
+    compile_warmup_start = time.monotonic()
+    log_gpu("compile_warmup_start")
 
     if compile_model:
         print(f"compiling model with torch.compile(mode={compile_mode!r})", flush=True)
@@ -1926,9 +1946,14 @@ def run_track1(
             write_config()
             run_train_warmup()
 
-    log_gpu("before_train_loop")
     optimizer_zero_grad()
-    train_loop_start = time.monotonic()
+    torch.cuda.reset_peak_memory_stats(gpu_index)
+    peak_gpu_stats.clear()
+    log_gpu("budget_start")
+    log_gpu("before_train_loop")
+    budget_start = time.monotonic()
+    train_deadline = budget_start + minutes * 60.0
+    train_loop_start = budget_start
 
     full_decay_start_time: float | None = None
 
@@ -2007,6 +2032,7 @@ def run_track1(
                     "tokens": tokens,
                     "supervised_tokens": supervised_tokens_seen,
                     "step_supervised_tokens": accum_supervised_tokens,
+                    "elapsed_compile_warmup_seconds": budget_start - compile_warmup_start,
                     "elapsed_budget_seconds": elapsed_budget_seconds,
                     "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
                     "tokens_per_second": tokens / max(elapsed_budget_seconds, 1.0e-9),
@@ -2022,6 +2048,7 @@ def run_track1(
     budget_end = time.monotonic()
     elapsed_budget_seconds = budget_end - budget_start
     elapsed_train_loop_seconds = budget_end - train_loop_start
+    elapsed_compile_warmup_seconds = budget_start - compile_warmup_start
     # Keep post-budget evaluation from triggering a new compiled eval graph.
     model = uncompiled_model
     final_loss = evaluate("final_eval")
@@ -2038,6 +2065,7 @@ def run_track1(
         "steps": step,
         "tokens": tokens,
         "supervised_tokens": supervised_tokens_seen,
+        "elapsed_compile_warmup_seconds": elapsed_compile_warmup_seconds,
         "elapsed_budget_seconds": elapsed_budget_seconds,
         "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
         "elapsed_train_seconds": elapsed_budget_seconds,

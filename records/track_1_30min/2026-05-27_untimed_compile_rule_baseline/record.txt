@@ -1,0 +1,21 @@
+Track 1 (30min)
+Description: untimed_compile_rule_baseline
+Contributors: 
+Date: 2026-05-27
+Data mode: sft
+Loss mask: assistant_only
+Sequence packing: True (stream_concat_no_padding)
+Adapter mode: gralora
+Minutes: 30.0
+Eval loss drop: 0.039796
+Baseline eval loss: 1.040048
+Final eval loss: 1.000252
+Steps: 558
+Tokens: 18,284,544
+Supervised tokens: 14,124,390
+Eval supervised tokens: 205,272
+Compile + warmup (untimed): 342.2s
+Elapsed budget: 1800.6s
+Budget tokens/sec: 10155
+Train-loop elapsed: 1800.6s
+Train-loop tokens/sec: 10155
