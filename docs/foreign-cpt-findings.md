@@ -79,7 +79,7 @@ because Qwen's tokenizer treats Latin-with-subscripts transliteration as
 many unfamiliar tokens, inflating both baseline and headroom. ConlangCrafter
 gives the lowest final loss and is the chosen canonical because it scales.
 
-### Track 1 — 30 minutes (ConlangCrafter, seed 1337)
+### Track 1 — 30 minutes (ConlangCrafter, seed 1337, LoRA-era)
 
 | Metric | Value |
 |---|---:|
@@ -91,12 +91,46 @@ gives the lowest final loss and is the chosen canonical because it scales.
 | supervised tok/s | 10,989 |
 | peak GPU util | 100% |
 
-Snapshot:
-[`records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/`](../records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/)
-· [Modal run](https://modal.com/apps/tear-labs-43657/main/ap-lv4L5notEjWXBIJhrpNcOe).
+Snapshot: [Modal run](https://modal.com/apps/tear-labs-43657/main/ap-lv4L5notEjWXBIJhrpNcOe).
+The original LoRA-era record artifact under `records/track_1_30min/` was
+removed when the trainer dropped all PEFT/adapter code in favour of full
+fine-tuning; see the README leaderboard for the current canonical record.
 
 Roughly **10× the previous best Track 1 signal** (Hermes-SFT GraLoRA at
 +0.052).
+
+### Track 2 optimizer ablation (full FT, seed 1337, 2026-05-28)
+
+After the LoRA strip we re-ran Track 2 to pick the default optimizer for
+the full-fine-tune trainer. The Muon family uses modded-nanogpt's
+hybrid convention (Muon/NorMuon/Muon8 on 2D hidden weights, AdamW8bit
+tail on embed/lm\_head/1D params), wired via the new `--muon-lr` and
+`--adamw-tail-lr` flags. The hybrid groups were run at
+`muon_lr=2e-4`, `adamw_tail_lr=2e-5` (a 10× ratio — Muon's normalized
+updates need a larger nominal LR).
+
+| Rank | Optimizer            | Eval-loss drop | Baseline | Final | Steps | Compile/warmup | GPU SKU |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 1  | **adamw\_fused**     | **+0.4972**    | 0.854    | 0.357 | 77    | 238s           | H100 SXM5 |
+| 2  | muon8 hybrid         | +0.4868        | 0.854    | 0.368 | 82    | 219s           | H100 SXM5 |
+| 3  | muon hybrid          | +0.4862        | 0.854    | 0.368 | 86    | 218s           | H100 SXM5 |
+| 4  | normuon hybrid       | +0.4570        | 0.854    | 0.397 | 65    | 234s           | H100 NVL (slower) |
+
+Takeaways:
+- **AdamW fused wins at the 5-min Track 2 budget**, so it is the new
+  `auto` default. The Muon family closes most of the gap once the
+  10× LR ratio is applied, but doesn't beat AdamW within 300 timed
+  seconds at this model/data scale.
+- **Muon8 ≈ Muon**: 8-bit blockwise momentum costs basically nothing in
+  loss drop here. Useful if optimizer-state memory becomes a constraint
+  at larger Track-3 budgets or different model sizes.
+- **NorMuon's lower rank is partly a confound**: it landed on an
+  H100 NVL where step time was ~25 % higher, so it completed 65 steps
+  vs 77-86 for the others. A re-run on SXM5 would close some of the
+  gap but is unlikely to leapfrog AdamW.
+- A naive Muon run at `muon_lr=2e-5` (same as AdamW) scored only
+  **+0.389** — the per-group LR convention matters; without it Muon
+  underutilizes its update budget.
 
 ## Interpretation
 

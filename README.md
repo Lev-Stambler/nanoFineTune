@@ -11,7 +11,7 @@ language corpus that the base model has never seen.
 score = baseline_eval_loss − final_eval_loss
 ```
 
-Higher is better. The current record is **+0.540**.
+Higher is better. The current Track 2 record is **+0.497**.
 
 ## Leaderboard
 
@@ -19,13 +19,16 @@ Higher is better. The current record is **+0.540**.
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|---:|---|---|---|---|
-| 1 | **+0.540** | ConlangCrafter CPT full fine-tune, seed 1337, AdamW fused, lr 2e-4, mb 8, LoRA r=32, flex-attention, max-autotune-no-cudagraphs (pre-full-FT-default snapshot) | 2026-05-28 | [summary](records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/summary.json) | @levstamb |
+| 1 | — | (open) | — | — | — |
 
 ### Track 2 — 5 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|---:|---|---|---|---|
-| 1 | **+0.510** | ConlangCrafter CPT LoRA, baseline 0.854 → final 0.345, 101 steps, 3.31M tokens (pre-full-FT-default snapshot) | 2026-05-27 | [Modal](https://modal.com/apps/tear-labs-43657/main/ap-ZQyBFDPmLUkkHl9O6JmUGB) | — |
+| 1 | **+0.4972** | Full FT, AdamW fused, lr 2e-5, mb 1 × ga 8, seed 1337, flex-attention, max-autotune-no-cudagraphs | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_adamw_fused_full-FT_seed1337/summary.json) | @levstamb |
+| 2 | +0.4868 | Full FT, Muon8 hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_muon8_hybrid_full-FT_seed1337/summary.json) | @levstamb |
+| 3 | +0.4862 | Full FT, Muon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_muon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
+| 4 | +0.4570 | Full FT, NorMuon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 — ran on H100 NVL (slower per step) | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_normuon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
 
 ### Track 3 — 2 hours
 

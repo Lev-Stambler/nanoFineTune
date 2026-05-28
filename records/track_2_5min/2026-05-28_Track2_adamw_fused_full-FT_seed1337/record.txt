@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 adamw_fused full-FT seed1337
+Contributors: @levstamb
+Date: 2026-05-28
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.497196
+Baseline eval loss: 0.854382
+Final eval loss: 0.357186
+Steps: 77
+Tokens: 2,523,136
+Supervised tokens: 2,522,520
+Eval supervised tokens: 262,144
+Compile + warmup (untimed): 238.4s
+Elapsed budget: 302.6s
+Budget tokens/sec: 8339
+Train-loop elapsed: 302.6s
+Train-loop tokens/sec: 8339

@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 muon hybrid full-FT seed1337
+Contributors: @levstamb
+Date: 2026-05-28
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.486192
+Baseline eval loss: 0.854382
+Final eval loss: 0.368190
+Steps: 86
+Tokens: 2,818,048
+Supervised tokens: 2,817,360
+Eval supervised tokens: 262,144
+Compile + warmup (untimed): 218.4s
+Elapsed budget: 302.5s
+Budget tokens/sec: 9316
+Train-loop elapsed: 302.5s
+Train-loop tokens/sec: 9316
