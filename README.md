@@ -352,6 +352,16 @@ logged baseline/utilization iteration, not a valid competition record under the
 positive-loss-drop rule. The older v1 snapshot predates the scoring cleanup that
 moved compile and warmup inside the timed budget.
 
+### Track 1 — 30 minutes (foreign-distribution CPT)
+
+| # | Loss drop | Description | Date | Log | Contributors |
+|---|-----------|-------------|------|-----|--------------|
+| conlang-v1 (seed 1337) | **+0.540** | CPT LoRA on `TearedModels/conlangcrafter-cpt-bd412d52` (ConlangCrafter synthetic conlang), 604 steps, 19.79M tokens, baseline 0.854 → final 0.315, 10989 supervised tok/s, 100% peak GPU util | 2026-05-28 | [summary](records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/summary.json) · [Modal](https://modal.com/apps/tear-labs-43657/main/ap-lv4L5notEjWXBIJhrpNcOe) | @levstamb |
+
+Single-seed logged baseline. A record submission needs additional seeds for
+statistical significance — repeat with `--seed 2027` and `--seed 4099` and
+add them here.
+
 ### Legacy CPT Track 1 — 30 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
