@@ -251,6 +251,11 @@ Open a PR with the new record folder. The PR should:
 
 ## Foreign-distribution CPT datasets
 
+> **Full writeup:** [`docs/foreign-cpt-findings.md`](docs/foreign-cpt-findings.md)
+> — methodology, results, interpretation, caveats, reproduction commands.
+
+
+
 The Track 1 SFT default (`HuggingFaceH4/ultrachat_200k`) is general English
 chat, which is close to `Qwen3.5-4B-Base`'s pretraining distribution and
 therefore gives only a small `baseline_eval_loss − final_eval_loss` signal. To
