@@ -13,3 +13,6 @@ data/
 
 *.log
 *.tmp
+
+# Claude Code session-local state (cron scheduler lockfile, etc.)
+.claude/
