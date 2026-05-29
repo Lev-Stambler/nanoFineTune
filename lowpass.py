@@ -49,7 +49,7 @@ _FIXED_PROJECTOR_CACHE: dict[tuple[str, int, int, str, int, str], Tensor] = {}
 class LowpassConfig:
     """All knobs follow `InstantConfig` in the reference impl."""
 
-    max_seq_len: int = 4096
+    max_seq_len: int = 256
     activation_energy: float = 0.95
     gradient_energy: float = 0.95
     min_rank: int = 4
